@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Sunbird</title>
+<link rel="stylesheet" href="/app.css">
+
+<header class="masthead">
+  <h1>Sunbird</h1>
+  <p class="tagline">Send a file, encrypted on your device before it leaves.</p>
+</header>
+
+<main id="upload" hidden>
+  <section class="card">
+    <h2>File</h2>
+    <label id="drop-zone" class="drop" data-chosen="no">
+      <input id="file" type="file" class="visually-hidden">
+      <span id="drop-empty"><strong>Choose a file</strong> or drop it here</span>
+      <span id="drop-chosen" hidden><span id="chosen-name"></span> <span id="chosen-size" class="hint"></span></span>
+      <span class="hint">One file, up to 100 MiB.</span>
+    </label>
+  </section>
+
+  <section class="card">
+    <h2>Who can open it</h2>
+    <label class="check"><input id="protect" type="checkbox"> Require a passphrase</label>
+    <p id="mode-public" class="mode mode-public"><strong>Public link</strong>: anyone who has the link can
+      open this file. There is no passphrase or other second factor.</p>
+    <p id="mode-restricted" class="mode mode-restricted" hidden><strong>Passphrase-protected</strong>: the
+      file opens only with the link and the passphrase together. Send the passphrase separately from the link.</p>
+    <label class="field" for="passphrase">Passphrase</label>
+    <input id="passphrase" type="password" autocomplete="new-password" disabled>
+    <p id="passphrase-hint" class="hint">Length is what makes a passphrase hard to guess: a few ordinary
+      words beat one short word full of symbols, and are easier to say aloud. It is used exactly as typed,
+      spaces included. <span id="passphrase-length">0 characters</span></p>
+  </section>
+
+  <section class="card">
+    <h2>Limits</h2>
+    <div class="pair">
+      <div>
+        <label class="field" for="expiry">Expires after</label>
+        <select id="expiry">
+          <option value="3600">1 hour</option>
+          <option value="86400" selected>24 hours</option>
+          <option value="259200">3 days</option>
+          <option value="604800">7 days</option>
+        </select>
+      </div>
+      <div>
+        <label class="field" for="downloads">Download limit</label>
+        <select id="downloads">
+          <option value="1" selected>1 download</option>
+          <option value="5">5 downloads</option>
+          <option value="10">10 downloads</option>
+          <option value="0">No download limit (expires by time only)</option>
+        </select>
+      </div>
+    </div>
+    <p class="hint">These limits are sealed into the file, and cannot be changed after upload. The server
+      stops serving the file and deletes it when the first one is reached.</p>
+  </section>
+
+  <section class="card">
+    <h2>Upload token</h2>
+    <label class="field" for="upload-token">Your upload token</label>
+    <input id="upload-token" type="password" autocomplete="off" spellcheck="false">
+    <p id="token-note" class="hint">This is a shared server. Your upload token identifies you to the
+      server's admin: every file you upload is recorded as yours, so the admin can see who uploaded a file
+      and remove it. Anyone with your token uploads as you.</p>
+    <label class="check"><input id="remember-token" type="checkbox"> Remember the token in this browser</label>
+  </section>
+
+  <section class="card commit">
+    <button id="upload-button" type="button" class="primary">Encrypt and upload
+      <span class="button-mode">(<span id="upload-mode">public link</span>)</span></button>
+    <p id="upload-status" class="status" role="status"></p>
+    <ol id="upload-steps" class="steps" hidden>
+      <li data-step="stretch" data-state="pending">
+        <span class="step-name">Stretching the passphrase</span>
+        <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on
+          purpose: every guess at the passphrase costs this much, for anyone who gets the link and the
+          file without it. Usually 1–3 seconds on a phone.</p>
+        <progress max="1" value="0"></progress>
+        <span class="step-detail"></span>
+      </li>
+      <li data-step="encrypt" data-state="pending">
+        <span class="step-name">Encrypting on this device</span>
+        <progress max="1" value="0"></progress>
+        <span class="step-detail"></span>
+      </li>
+      <li data-step="upload" data-state="pending">
+        <span class="step-name">Uploading</span>
+        <progress max="1" value="0"></progress>
+        <span class="step-detail"></span>
+      </li>
+    </ol>
+  </section>
+
+  <section id="result" class="card result" hidden>
+    <h2>Uploaded</h2>
+    <label class="field" for="link">Link</label>
+    <div class="copy-row">
+      <input id="link" type="text" readonly>
+      <button id="copy-link" type="button">Copy link</button>
+    </div>
+    <p id="copy-link-status" class="status" role="status"></p>
+    <p id="link-public" class="mode mode-public" hidden>This link is the whole key. Anyone who has all of it
+      can open the file, and nothing else is asked for, so share it only with the people who should have the file.</p>
+    <p id="link-restricted" class="mode mode-restricted" hidden>This link alone does not open the file: the
+      passphrase is needed too. Send the passphrase by a different route from the link.</p>
+    <p class="hint">The part after the <code>#</code> is the key to the file. It never reaches
+      the server: browsers do not send it.</p>
+    <div class="token-box">
+      <p><strong>Owner token. Save this token now. It is shown once.</strong></p>
+      <div class="copy-row">
+        <code id="owner-token"></code>
+        <button id="copy-token" type="button">Copy token</button>
+      </div>
+      <p id="copy-token-status" class="status" role="status"></p>
+      <p>It is the only way to delete the file before it expires, and it cannot be recovered: the
+        server keeps only a fingerprint of it.</p>
+    </div>
+  </section>
+</main>
+
+<main id="download" hidden>
+  <section class="card">
+    <h2>Receive a file</h2>
+    <p id="download-public" class="mode mode-public" hidden><strong>Public link</strong>: this file opens with
+      the link alone. No passphrase is needed.</p>
+    <p id="download-restricted" class="mode mode-restricted" hidden><strong>Passphrase-protected</strong>: this
+      file opens only with the link and its passphrase together.</p>
+    <p id="download-status" class="status" role="status"></p>
+    <form id="unlock" hidden>
+      <label class="field" for="unlock-passphrase">Passphrase</label>
+      <div class="copy-row">
+        <input id="unlock-passphrase" type="password" autocomplete="off">
+        <button id="unlock-button" type="submit" class="primary">Open</button>
+      </div>
+    </form>
+    <ol id="download-steps" class="steps" hidden>
+      <li data-step="stretch" data-state="pending">
+        <span class="step-name">Stretching the passphrase</span>
+        <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on
+          purpose: every guess at the passphrase costs this much, for anyone who gets the link and the
+          file without it. Usually 1–3 seconds on a phone.</p>
+        <progress max="1" value="0"></progress>
+        <span class="step-detail"></span>
+      </li>
+      <li data-step="download" data-state="pending">
+        <span class="step-name">Downloading the encrypted file</span>
+        <progress max="1" value="0"></progress>
+        <span class="step-detail"></span>
+      </li>
+      <li data-step="decrypt" data-state="pending">
+        <span class="step-name">Decrypting and checking every piece</span>
+        <progress max="1" value="0"></progress>
+        <span class="step-detail"></span>
+      </li>
+    </ol>
+  </section>
+
+  <section id="details" class="card" hidden>
+    <p id="expired-warning" role="alert" hidden></p>
+    <dl class="facts">
+      <dt>Name</dt><dd id="file-name"></dd>
+      <dt>Size</dt><dd id="file-size"></dd>
+      <dt>Expires</dt><dd id="file-expiry"></dd>
+      <dt>Download limit</dt><dd id="file-limit"></dd>
+    </dl>
+    <button id="download-button" type="button" class="primary">Download</button>
+    <p class="hint">The file is saved to your device once every piece has checked out. This page never
+      opens or shows it.</p>
+  </section>
+</main>
+
+<script src="/src/argon2.js"></script>
+<script src="/src/crypto.js"></script>
+<script src="/src/app.js"></script>

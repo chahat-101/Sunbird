@@ -1,0 +1,79 @@
+{
+  "made_by": "a server at schema version 5, before this rewrite, through its HTTP API",
+  "made_at": 1790584249,
+  "uploader_id": "1R5xlvRtapUm2EVGWwDsOA",
+  "files": [
+    {
+      "label": "empty",
+      "id": "36xhqbEclHJuyJ7V",
+      "ownerToken": "iy4Q5tfDnY96KfceTodRnBa_n3vp5onZzX-nJLgzcV8",
+      "size": 0,
+      "seed": 1,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expires_at": 1791188449,
+      "max_downloads": 0,
+      "downloads": 0,
+      "state": "present"
+    },
+    {
+      "label": "small",
+      "id": "E_PcXknDSZMNbLTi",
+      "ownerToken": "tiHAQKovrcMBhb4GzqGxnHT4eCINpCj-p3d3UPU6rbs",
+      "size": 100,
+      "seed": 2,
+      "sha256": "ab4c36accb3e5c508c2d4e491c3eae7449b5bdb681a5ca1c667439a5292cf69b",
+      "expires_at": 1791188449,
+      "max_downloads": 0,
+      "downloads": 0,
+      "state": "present"
+    },
+    {
+      "label": "past-preview",
+      "id": "TGS6vQ-TtZSj0iWs",
+      "ownerToken": "t5kRH6JhTswNyhDJxTD5C7orfMEEXWO78YCfGsuQ0RE",
+      "size": 9000,
+      "seed": 3,
+      "sha256": "45b44d68a0acf29bcad60544c3024c47efb5fa3153eff3c70379235539e0d80b",
+      "expires_at": 1791188449,
+      "max_downloads": 3,
+      "downloads": 1,
+      "state": "present"
+    },
+    {
+      "label": "records",
+      "id": "VlDKxnQ4fjUcmR_a",
+      "ownerToken": "e-4SNmg3O8wN3xIWEebcGt7GSH3kvHxC3K87swcLZUE",
+      "size": 70000,
+      "seed": 4,
+      "sha256": "de843e7116c2e58f54f11f2384c727981a6dcc3d3ff1835a08f81c0f06a833b2",
+      "expires_at": 1791188449,
+      "max_downloads": 0,
+      "downloads": 0,
+      "state": "present"
+    },
+    {
+      "label": "owner-deleted",
+      "id": "mUUvQFwUzBZsdH_l",
+      "ownerToken": "ThlJ2iDgj81dy00JVHiqPfu1BfFp00_i3AzhnPc_qd8",
+      "size": 500,
+      "seed": 5,
+      "sha256": "102a56c63c6b62fd4f2469decac32d473ca1c693261e5afd8e850e0560da4e8c",
+      "expires_at": 1791188449,
+      "max_downloads": 0,
+      "downloads": 0,
+      "state": "gone"
+    },
+    {
+      "label": "one-download",
+      "id": "H8ABieqQWTornbU6",
+      "ownerToken": "_PHlrpMKbdkSn3uN_4_gov_VlHi0QNR9nEVZRJLKZcU",
+      "size": 600,
+      "seed": 6,
+      "sha256": "f45fb3d9f8f890327499287ba2c013f07a876317f1280eec67578d8f40c908c3",
+      "expires_at": 1791188449,
+      "max_downloads": 1,
+      "downloads": 1,
+      "state": "gone"
+    }
+  ]
+}

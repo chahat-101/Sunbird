@@ -1,0 +1,950 @@
+<!-- Open this file directly in a browser. No build step, no server. -->
+<meta charset="utf-8">
+<title>Sunbird crypto tests</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; }
+  li.pass::before { content: "PASS  "; color: #1a7f37; font-weight: bold; }
+  li.fail::before { content: "FAIL  "; color: #cf222e; font-weight: bold; }
+  li { list-style: none; font-family: ui-monospace, monospace; white-space: pre-wrap; }
+  #summary[data-status="pass"] { color: #1a7f37; }
+  #summary[data-status="fail"] { color: #cf222e; }
+</style>
+<h1>Sunbird crypto tests</h1>
+<p id="summary" data-status="running">Running… (each Argon2id run takes a moment)</p>
+<ul id="results"></ul>
+
+<script src="../vendor/hash-wasm/argon2.umd.min.js"></script>
+<script src="../src/crypto.js"></script>
+<script>
+'use strict';
+const C = SunbirdCrypto;
+
+// Known-answer vectors from an independent implementation (Python
+// `cryptography` 50: Argon2id v0x13, HKDF-SHA256, AES-256-GCM, SHA-256), over
+// fixed inputs. They pin the parameters, not just self-consistency: a round
+// trip passes even with the wrong Argon2 version, memory unit or info string.
+// Regenerated with the same library when the info strings and the test
+// passphrase were renamed to sunbird (protocol.md, history), by a generator
+// first checked to reproduce every earlier vector exactly.
+const KAT = {
+  fragmentSecret: range(0x00, 0x10),
+  fragment: 'AAECAwQFBgcICQoLDA0ODw',
+  salt: range(0x10, 0x20),
+  fileKey: range(0x20, 0x40),
+  // Escapes, so no editor can normalize the two into the same bytes.
+  passphraseNfd: 'é sunbird',
+  passphraseNfc: 'é sunbird',
+  pwKey: 'c5149c70ce74d0f923b88f8e36ece0c580fe7a12b3575728dbf804174fddcc4a',
+  wrappingKeyRestricted: '4b2891f402e666a1537ad67e3769ab585e0b6dc09f7c5df4dd5dd8ae20dfbc00',
+  wrappingKeyPublic: 'c67e8b807e66a41c203693bbd15c691f4d4e82dd622b0118b81dd243147e5d52',
+  // iv = 40..4b
+  entryRestricted: '01003c404142434445464748494a4b0d677d1aacf13779d763654fe32d62bbc82f5f25d13a2cd7093f14c28859a45c45ba8839f12f7c6739c73e2a957d0d9b',
+  entryPublic: '01003c404142434445464748494a4b886dc5773030f767c856f9dfded140a8b25ea7686581c9755b60c5c37f8243f006f0f41c0c5eb9a80869cf6bf1327a6d',
+
+  // §4.3 keys from fileKey and salt.
+  contentKey: 'b1633ecaeab80d1fd3289c0bdbb334cb81b88ff6fff86bce50146138b77c93b0',
+  nonceBase: 'de44dc8e005b47903b273106',
+  // header_core = 01 00 ‖ salt ‖ u64 1790000000 ‖ u32 1 ‖ 528 bytes (i*7 mod 256),
+  // a stand-in for metadata_ct. Plaintexts are (i mod 251).
+  headerCoreSha256: '41cd5dbe5c2477abe941cb45558f3657911130f33a18bd59883d1b7ab57c56d2',
+  records: [
+    { size: 0, length: 17, sha256: '886451072006154d6fd28d2ead1b8d934254cb28244ba9ced909be6233a94f22', hex: 'c4d1af7b2703e244a5c62dd6a298450a9f' },
+    { size: 3, length: 20, sha256: '5652ae33e875aeb768aee9fe411959bbf797b638d5d9c5bacca33d98af704099', hex: 'c621b403c2001f4437be4bf75da7851348decfd1' },
+    { size: 65519, length: 65536, sha256: '2bbf5d5ff1ac00e7004110f0a3e086690d7b66990576429677ebf3ca2a53b2a1' },
+    { size: 65520, length: 65554, sha256: 'c9f5cb6d2018477fd4032da9bd65f43e555f8a04121862897a58288923a20e64' },
+    { size: 131038, length: 131072, sha256: 'dda60b0241b9959f87b2aa7874632d7e3143502e297a4fe33f94c2903dc5062c' },
+  ],
+  // The 65520-byte file: SHA-256 of record 0, and all of record 1 (1 data byte).
+  split65520: {
+    record0Sha256: 'cf6e5b1bd440bddb9b532577d68ca5e8f5d5a131b12259e0ea7ffc621872f7cd',
+    record1: '46e6dd70d6cbe1517cda84c25bace0610b7d',
+  },
+
+  // §7 metadata from fileKey and salt. header_prefix = 01 00 ‖ salt ‖
+  // u64 1790000000 ‖ u32 1. JSON is compact, keys in this order, UTF-8
+  // unescaped: {"name":"नमस्ते.txt","type":"text/plain","size":3} (62 bytes).
+  metadataKey: 'd228f7ae2844c2976398e618d6b8ce87a9c03242d9a9e03d613e6ea679a41050',
+  metadataIv: 'f55e6e272d95cdc2cd668e2c',
+  headerPrefix: '0100101112131415161718191a1b1c1d1e1f000000006ab13b8000000001',
+  metadata: { name: 'नमस्ते.txt', type: 'text/plain', size: 3 },
+  metadataCt: '995f5767f4cbe7513dcd306457d8deeb70189417404710494a739a79e5b391c1682b95f0cc2d2356eee6151e4c019540cd584d339dbdae6ca11495a273274d4e8f728fb2cd36e1dc3ee91c4a9a7de592d5b4216bc7b15e5b284c3d9243cbfbd1c3aeaf37bec8b4b5c6de36c7d9bb662a68da93fa0d3ed3ae33fa8317ada0a32a66beebbe238223db3907a10f6d337a885ff9c07decb9fa46de98da82b289b8c787b776b5c8d82d44f8b3028188fa8be5f858029836f2316fc6f5b25d2846f721e4eafce227c2c546f7364ed8913e409fad83bb2e987b6ef6a2e1f4b6c866207a81367054709fdfb778df8fb9ef6b0f2c49cf10fc01b3a461f28450cd3776aa3d506b6df40cff906266f70eb07952862040dac4faf617c826aeda7dc0841fcf9e6970615fa42e1ec9265331594135b0f0def8c3b2fbce59783e8b1015720eb8e8b60aa344c74122f7d4eb4d046e7db3777804182ba977998f0cf0a725175404bf4ace3a75a0f5e136fc8b7afe1988c25ca47728123cf8762052fc66e53b37c6ea85cf76917646a0c3ddc64bce233ab7583b6b1bb071410e8622185f3007a704155266f8a9bea0c5dac081aaab3da9e67d3f4867cd41eeeed151277598b0ea66591339ecd17859df6fe4cb0636dbacce0cd2a160399e86d139a63a6f2082e48fc029eddae992c7844d84a79c7ca29853c45bc5b66687ee8b180fa31f28d55fbfd1da709a87ffda2d40b9337be1881b5381',
+};
+
+function range(a, b) { return Uint8Array.from({ length: b - a }, (_, i) => a + i); }
+function hex(u8) { return Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join(''); }
+function unhex(s) { return Uint8Array.from(s.match(/../g), (h) => parseInt(h, 16)); }
+function pattern(n) { const u = new Uint8Array(n); for (let i = 0; i < n; i++) u[i] = i % 251; return u; }
+function randomBytes(n) {
+  const u = new Uint8Array(n);
+  for (let i = 0; i < n; i += 65536) crypto.getRandomValues(u.subarray(i, Math.min(n, i + 65536)));
+  return u;
+}
+function join(...parts) {
+  const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+async function sha256(u8) { return new Uint8Array(await crypto.subtle.digest('SHA-256', u8)); }
+
+function katHeaderCore() {
+  const h = new Uint8Array(558);
+  h[0] = 0x01; h[1] = 0x00;
+  h.set(KAT.salt, 2);
+  const dv = new DataView(h.buffer);
+  dv.setUint32(18, 0); dv.setUint32(22, 1790000000); dv.setUint32(26, 1);
+  for (let i = 0; i < 528; i++) h[30 + i] = (i * 7) % 256;
+  return h;
+}
+function randomHeaderCore() {
+  const h = randomBytes(558);
+  h[0] = 0x01; h[1] = 0x00;
+  return h;
+}
+
+function eq(actual, expected, what) {
+  const a = actual instanceof Uint8Array ? hex(actual) : actual;
+  const e = expected instanceof Uint8Array ? hex(expected) : expected;
+  if (a !== e) throw new Error(`${what}: expected ${e}, got ${a}`);
+}
+function ne(actual, other, what) {
+  if (hex(actual) === hex(other)) throw new Error(`${what}: values unexpectedly equal`);
+}
+function sameBytes(actual, expected, what) {
+  if (actual.length !== expected.length) throw new Error(`${what}: length ${actual.length}, expected ${expected.length}`);
+  for (let i = 0; i < actual.length; i++) {
+    if (actual[i] !== expected[i]) throw new Error(`${what}: first difference at byte ${i}`);
+  }
+}
+// Passes only if fn throws — and, when `code` is given, throws for that
+// reason. A function that returns anything, right or wrong, fails the test.
+async function rejects(fn, what, code) {
+  let result;
+  try {
+    result = await fn();
+  } catch (err) {
+    if (code !== undefined && err.code !== code) {
+      throw new Error(`${what}: expected error code '${code}', got '${err.code}' (${err.message})`);
+    }
+    return err;
+  }
+  const shown = result instanceof Uint8Array ? `${result.length} bytes` : String(result);
+  throw new Error(`${what}: expected an error, but it returned ${shown}`);
+}
+
+const tests = [];
+function test(name, fn) { tests.push({ name, fn }); }
+
+// ---- §2 fragment ----------------------------------------------------------
+
+test('fragment: generated secret is 16 bytes, encodes to 22 chars, decodes back', async () => {
+  const s = C.generateFragmentSecret();
+  eq(s.length, 16, 'length');
+  const f = C.encodeFragment(s);
+  eq(f.length, 22, 'encoded length');
+  eq(C.decodeFragment(f), s, 'round trip');
+  ne(C.generateFragmentSecret(), s, 'two secrets');
+});
+
+test('fragment: known encoding', async () => {
+  eq(C.encodeFragment(KAT.fragmentSecret), KAT.fragment, 'encode');
+  eq(C.decodeFragment(KAT.fragment), KAT.fragmentSecret, 'decode');
+});
+
+test('fragment (§2): 21 and 23 characters rejected; of 64 possible 22nd characters only A Q g w accepted', async () => {
+  const prefix = KAT.fragment.slice(0, 21);
+  await rejects(() => C.decodeFragment(prefix), '21 characters', 'malformed');
+  await rejects(() => C.decodeFragment(KAT.fragment + 'A'), '23 characters', 'malformed');
+  await rejects(() => C.decodeFragment(prefix + 'x'), "22nd character 'x' (trailing bits 0001)", 'malformed');
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const accepted = [];
+  for (const ch of alphabet) {
+    try { C.decodeFragment(prefix + ch); accepted.push(ch); } catch (_) { /* rejected */ }
+  }
+  eq(accepted.join(''), 'AQgw', '22nd characters accepted');
+});
+
+test('fragment: other malformed spellings rejected', async () => {
+  const bad = {
+    'padded': KAT.fragment + '==',
+    'standard base64 alphabet': '+/ECAwQFBgcICQoLDA0ODw',
+    'empty': '',
+    'with leading #': '#' + KAT.fragment.slice(1),
+  };
+  for (const [why, f] of Object.entries(bad)) await rejects(() => C.decodeFragment(f), why);
+});
+
+// ---- §4.1 passphrase ------------------------------------------------------
+
+test('argon2id: known answer (v0x13, m=64 MiB, t=3, p=1), NFD input normalized to NFC', async () => {
+  eq(await C.passphraseKey(KAT.passphraseNfd, KAT.salt), unhex(KAT.pwKey), 'pw_key from NFD');
+  eq(await C.passphraseKey(KAT.passphraseNfc, KAT.salt), unhex(KAT.pwKey), 'pw_key from NFC');
+});
+
+test('passphrase (§4.1): precomposed and decomposed forms derive the same key; " pass " ≠ "pass"', async () => {
+  const precomposed = 'café 한';            // é as one code point; 한 as one syllable
+  const decomposed = 'café 한'; // e + combining acute; ㅎ ㅏ ㄴ jamo
+  if (precomposed === decomposed) throw new Error('inputs are identical strings: this test would prove nothing');
+  eq(precomposed.normalize('NFC'), decomposed.normalize('NFC'), 'inputs render identically');
+  eq(await C.passphraseKey(decomposed, KAT.salt), await C.passphraseKey(precomposed, KAT.salt), 'pw_key');
+  ne(await C.passphraseKey(' pass ', KAT.salt), await C.passphraseKey('pass', KAT.salt), '" pass " vs "pass"');
+});
+
+test('passphrase (§4.1): empty passphrase with the flag set is rejected at upload', async () => {
+  const secret = C.generateFragmentSecret();
+  const salt = C.generateSalt();
+  await rejects(() => C.deriveIkm(C.FLAG_PASSPHRASE, secret, salt, ''), 'empty string');
+  await rejects(() => C.deriveIkm(C.FLAG_PASSPHRASE, secret, salt), 'no passphrase');
+  await rejects(() => C.deriveIkm(C.FLAG_PASSPHRASE, secret, salt, null), 'null passphrase');
+  await rejects(() => C.passphraseKey('', salt), 'empty string to passphraseKey');
+});
+
+// ---- §4.2 ikm, §4.3 HKDF --------------------------------------------------
+
+test('ikm + HKDF: known wrapping keys, restricted (48-byte ikm) and public (16-byte ikm)', async () => {
+  const ikmR = await C.deriveIkm(C.FLAG_PASSPHRASE, KAT.fragmentSecret, KAT.salt, KAT.passphraseNfd);
+  eq(ikmR.length, 48, 'restricted ikm length');
+  eq(ikmR.subarray(0, 16), KAT.fragmentSecret, 'restricted ikm starts with fragment');
+  eq(ikmR.subarray(16), unhex(KAT.pwKey), 'restricted ikm ends with pw_key');
+  eq(await C.hkdf(ikmR, KAT.salt, 'sunbird/v1/wrap', 32), unhex(KAT.wrappingKeyRestricted), 'restricted wrapping_key');
+
+  const ikmP = await C.deriveIkm(0, KAT.fragmentSecret, KAT.salt);
+  eq(ikmP, KAT.fragmentSecret, 'public ikm is the fragment');
+  eq(await C.hkdf(ikmP, KAT.salt, 'sunbird/v1/wrap', 32), unhex(KAT.wrappingKeyPublic), 'public wrapping_key');
+});
+
+test('HKDF: known content_key and nonce_base', async () => {
+  eq(await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/content', 32), unhex(KAT.contentKey), 'content_key');
+  eq(await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/content-nonce', 12), unhex(KAT.nonceBase), 'nonce_base');
+  eq(await sha256(katHeaderCore()), unhex(KAT.headerCoreSha256), 'test header_core matches the vector\'s');
+});
+
+test('ikm: reserved flag bits and a stray passphrase are rejected', async () => {
+  await rejects(() => C.deriveIkm(0x02, KAT.fragmentSecret, KAT.salt), 'flags 0x02');
+  await rejects(() => C.deriveIkm(0x81, KAT.fragmentSecret, KAT.salt, 'x'), 'flags 0x81');
+  await rejects(() => C.deriveIkm(0, KAT.fragmentSecret, KAT.salt, 'x'), 'passphrase in public mode');
+  await rejects(() => C.deriveIkm(0, KAT.fragmentSecret.subarray(1), KAT.salt), '15-byte fragment');
+  await rejects(() => C.deriveIkm(0, KAT.fragmentSecret, KAT.salt.subarray(1)), '15-byte salt');
+});
+
+// ---- §5 wrap / unwrap -----------------------------------------------------
+
+function slotOf(...entries) { return join(new Uint8Array([entries.length]), ...entries); }
+function entryOf(type, bodyLength) {
+  const e = new Uint8Array(3 + bodyLength).fill(0xaa);
+  e[0] = type; e[1] = bodyLength >> 8; e[2] = bodyLength & 0xff;
+  return e;
+}
+async function publicWrappingKey(secret, salt) {
+  return C.deriveWrappingKey(await C.deriveIkm(0, secret, salt), salt);
+}
+
+test('unwrap: entries produced by the independent implementation', async () => {
+  const wkR = await C.deriveWrappingKey(
+    await C.deriveIkm(C.FLAG_PASSPHRASE, KAT.fragmentSecret, KAT.salt, KAT.passphraseNfc), KAT.salt);
+  eq(await C.unwrapSlot(wkR, slotOf(unhex(KAT.entryRestricted))), KAT.fileKey, 'restricted file_key');
+  const wkP = await publicWrappingKey(KAT.fragmentSecret, KAT.salt);
+  eq(await C.unwrapSlot(wkP, slotOf(unhex(KAT.entryPublic))), KAT.fileKey, 'public file_key');
+});
+
+async function roundTrip(flags, passphrase) {
+  // Uploader.
+  const secret = C.generateFragmentSecret();
+  const salt = C.generateSalt();
+  const fileKey = C.generateFileKey();
+  const entry = await C.wrapFileKey(
+    await C.deriveWrappingKey(await C.deriveIkm(flags, secret, salt, passphrase), salt), fileKey);
+  eq(entry.length, 63, 'entry length');
+  eq(entry.subarray(0, 3), new Uint8Array([0x01, 0x00, 0x3c]), 'type and length');
+  const slot = slotOf(entry);
+
+  // Recipient: only the link text, the salt and slot from the blob, and the passphrase.
+  const link = C.encodeFragment(secret);
+  const ikm = await C.deriveIkm(flags, C.decodeFragment(link), salt, passphrase);
+  eq(await C.unwrapSlot(await C.deriveWrappingKey(ikm, salt), slot), fileKey, 'file_key');
+  return { secret, salt, fileKey, slot };
+}
+
+test('round trip: public mode', async () => {
+  const { secret, salt, slot } = await roundTrip(0);
+  const other = await publicWrappingKey(C.generateFragmentSecret(), salt);
+  await rejects(() => C.unwrapSlot(other, slot), 'wrong fragment', 'wrong-passphrase');
+  const otherSalt = C.generateSalt();
+  const moved = await publicWrappingKey(secret, otherSalt);
+  await rejects(() => C.unwrapSlot(moved, slot), 'entry transplanted to a file with another salt', 'wrong-passphrase');
+});
+
+test('round trip: restricted mode, with the failures that must fail', async () => {
+  const pass = 'correct horse ≠ battery';
+  const { secret, salt, slot } = await roundTrip(C.FLAG_PASSPHRASE, pass);
+  const wrongPass = await C.deriveWrappingKey(
+    await C.deriveIkm(C.FLAG_PASSPHRASE, secret, salt, pass + '!'), salt);
+  await rejects(() => C.unwrapSlot(wrongPass, slot), 'wrong passphrase', 'wrong-passphrase');
+  const flagCleared = await publicWrappingKey(secret, salt);
+  await rejects(() => C.unwrapSlot(flagCleared, slot), 'server clears the passphrase flag', 'wrong-passphrase');
+});
+
+test('wrap: fresh IV every time; any flipped byte or bad framing fails to unwrap', async () => {
+  const wk = await publicWrappingKey(KAT.fragmentSecret, KAT.salt);
+  const e1 = await C.wrapFileKey(wk, KAT.fileKey);
+  const e2 = await C.wrapFileKey(wk, KAT.fileKey);
+  ne(e1.subarray(3, 15), e2.subarray(3, 15), 'IVs');
+
+  for (const [why, i] of [['iv', 3], ['wrapped_key', 20], ['tag', 62]]) {
+    const t = e1.slice(); t[i] ^= 0x01;
+    await rejects(() => C.unwrapSlot(wk, slotOf(t)), `flipped ${why} byte`, 'wrong-passphrase');
+  }
+  const relabeled = e1.slice(); relabeled[0] = 0x02;
+  await rejects(() => C.unwrapSlot(wk, slotOf(relabeled)), 'type relabeled', 'needs-newer-version');
+  const badLen = e1.slice(0, 62); badLen[2] = 0x3b;
+  await rejects(() => C.unwrapSlot(wk, slotOf(badLen)), '0x01 entry with body length 59', 'wrong-passphrase');
+  await rejects(() => C.unwrapSlot(wk, slotOf(e1.subarray(0, 62))), 'truncated entry', 'malformed');
+  await rejects(() => C.wrapFileKey(wk, KAT.fileKey.subarray(1)), '31-byte file_key');
+});
+
+// A file has one legitimate 0x01 entry; the first entry here stands for a
+// damaged or junk one in front of it (§5).
+test('slot (§5): two 0x01 entries where only the second unwraps — succeeds', async () => {
+  const salt = C.generateSalt();
+  const fileKey = C.generateFileKey();
+  const mine = await publicWrappingKey(C.generateFragmentSecret(), salt);
+  const theirs = await publicWrappingKey(C.generateFragmentSecret(), salt);
+  const theirEntry = await C.wrapFileKey(theirs, fileKey);
+  const myEntry = await C.wrapFileKey(mine, fileKey);
+
+  eq(await C.unwrapSlot(mine, slotOf(theirEntry, myEntry)), fileKey, 'second of two 0x01 entries');
+  eq(await C.unwrapSlot(theirs, slotOf(theirEntry, myEntry)), fileKey, 'first of two 0x01 entries');
+  const broken = theirEntry.slice(); broken[40] ^= 0xff;
+  eq(await C.unwrapSlot(mine, slotOf(broken, entryOf(0x02, 92), myEntry)), fileKey,
+    'after a damaged 0x01 and an unknown 0x02');
+});
+
+test('slot (§5): two 0x01 entries where neither unwraps — wrong passphrase, not unknown format', async () => {
+  const salt = C.generateSalt();
+  const fileKey = C.generateFileKey();
+  const a = await C.wrapFileKey(await publicWrappingKey(C.generateFragmentSecret(), salt), fileKey);
+  const b = await C.wrapFileKey(await publicWrappingKey(C.generateFragmentSecret(), salt), fileKey);
+  const mine = await publicWrappingKey(C.generateFragmentSecret(), salt);
+  await rejects(() => C.unwrapSlot(mine, slotOf(a, b)), 'two foreign 0x01 entries', 'wrong-passphrase');
+  await rejects(() => C.unwrapSlot(mine, slotOf(entryOf(0x02, 92), a, b)), 'with an unknown entry too', 'wrong-passphrase');
+});
+
+test('slot (§5): no entry of a known type — needs a newer version', async () => {
+  const wk = await publicWrappingKey(KAT.fragmentSecret, KAT.salt);
+  const err = await rejects(() => C.unwrapSlot(wk, slotOf(entryOf(0x02, 92), entryOf(0x7f, 0))),
+    'only unknown types', 'needs-newer-version');
+  eq(err.message, 'This link needs a newer version of Sunbird.', 'message');
+});
+
+test('slot (§3.1, §5): malformed slots rejected before any unwrap', async () => {
+  const wk = await publicWrappingKey(KAT.fragmentSecret, KAT.salt);
+  const good = unhex(KAT.entryPublic);
+  const cases = {
+    'empty slot': new Uint8Array(0),
+    'entry_count 0': new Uint8Array([0]),
+    'entry_count 65': slotOf(...Array.from({ length: 65 }, () => entryOf(0x7f, 0))),
+    'entry runs past end': join(new Uint8Array([2]), good),
+    'bytes after the last entry': join(slotOf(good), new Uint8Array([0])),
+    'header over 8 KiB': slotOf(entryOf(0x7f, 8192 - 558 - 1 - 3 + 1)),
+  };
+  for (const [why, slot] of Object.entries(cases)) await rejects(() => C.unwrapSlot(wk, slot), why, 'malformed');
+  // The largest slot that fits: 558 + 7634 = 8192.
+  await rejects(() => C.unwrapSlot(wk, slotOf(entryOf(0x7f, 8192 - 558 - 1 - 3))), 'exactly 8 KiB', 'needs-newer-version');
+});
+
+// ---- §6 records -----------------------------------------------------------
+
+// Opens one record directly with WebCrypto and the vector keys, independent of
+// decryptRecords, to inspect what the plaintext actually contains.
+async function openKatRecord(record, i) {
+  const key = await crypto.subtle.importKey('raw', unhex(KAT.contentKey), 'AES-GCM', false, ['decrypt']);
+  const nonce = unhex(KAT.nonceBase);
+  nonce[11] ^= i & 0xff; nonce[10] ^= (i >> 8) & 0xff;
+  const aad = join(new Uint8Array([0x01]), unhex(KAT.headerCoreSha256), new Uint8Array(8));
+  aad[39] = (i >> 8) & 0xff; aad[40] = i & 0xff;
+  return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce, additionalData: aad }, key, record));
+}
+async function sealKatRecord(plaintext, i) {
+  const key = await crypto.subtle.importKey('raw', unhex(KAT.contentKey), 'AES-GCM', false, ['encrypt']);
+  const nonce = unhex(KAT.nonceBase);
+  nonce[11] ^= i & 0xff; nonce[10] ^= (i >> 8) & 0xff;
+  const aad = join(new Uint8Array([0x01]), unhex(KAT.headerCoreSha256), new Uint8Array(8));
+  aad[39] = (i >> 8) & 0xff; aad[40] = i & 0xff;
+  return new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, additionalData: aad }, key, plaintext));
+}
+
+test('records KAT: encryption matches the independent implementation byte for byte', async () => {
+  const hc = katHeaderCore();
+  for (const v of KAT.records) {
+    const body = await C.encryptRecords(KAT.fileKey, hc, pattern(v.size));
+    eq(body.length, v.length, `${v.size}-byte file: length`);
+    eq(await sha256(body), unhex(v.sha256), `${v.size}-byte file: SHA-256`);
+    if (v.hex) eq(body, unhex(v.hex), `${v.size}-byte file: bytes`);
+  }
+});
+
+test('records KAT: decrypts records produced by the independent implementation', async () => {
+  const hc = katHeaderCore();
+  eq(await C.decryptRecords(KAT.fileKey, hc, unhex(KAT.records[0].hex), 0), new Uint8Array(0), '0-byte file');
+  eq(await C.decryptRecords(KAT.fileKey, hc, unhex(KAT.records[1].hex), 3), pattern(3), '3-byte file');
+
+  // Record 1 (nonce_base XOR 1, AAD counter 1) comes from Python, not from us.
+  const record0 = (await C.encryptRecords(KAT.fileKey, hc, pattern(65520))).subarray(0, 65536);
+  eq(await sha256(record0), unhex(KAT.split65520.record0Sha256), 'record 0');
+  const body = join(record0, unhex(KAT.split65520.record1));
+  sameBytes(await C.decryptRecords(KAT.fileKey, hc, body, 65520), pattern(65520), '65520-byte file');
+});
+
+test('records: round trip a 1 MB buffer', async () => {
+  const header = randomHeaderCore();
+  const fileKey = C.generateFileKey();
+  const plaintext = randomBytes(1048576);
+  const body = await C.encryptRecords(fileKey, header, plaintext);
+  eq(body.length, 16 * 65536 + (1048576 - 16 * 65519) + 17, 'ciphertext length (17 records)');
+  sameBytes(await C.decryptRecords(fileKey, header, body, plaintext.length), plaintext, 'plaintext');
+});
+
+test('records: round trip a 0-byte file — one record whose plaintext is the single byte 0x02', async () => {
+  const hc = katHeaderCore();
+  const body = await C.encryptRecords(KAT.fileKey, hc, new Uint8Array(0));
+  eq(body.length, 17, 'ciphertext length');
+  eq(await openKatRecord(body, 0), new Uint8Array([0x02]), 'record plaintext');
+  eq((await C.decryptRecords(KAT.fileKey, hc, body, 0)).length, 0, 'decrypted length');
+});
+
+test('records: round trip exactly 65519 bytes (one full final record) and 131038 (two)', async () => {
+  const hc = katHeaderCore();
+
+  const one = randomBytes(65519);
+  const body1 = await C.encryptRecords(KAT.fileKey, hc, one);
+  eq(body1.length, 65536, '65519: one record of 65536 bytes');
+  const r = await openKatRecord(body1, 0);
+  eq(r.length, 65520, '65519: record plaintext length');
+  eq(r[65519], 0x02, '65519: delimiter');
+  sameBytes(await C.decryptRecords(KAT.fileKey, hc, body1, 65519), one, '65519: plaintext');
+
+  const two = randomBytes(131038);
+  const body2 = await C.encryptRecords(KAT.fileKey, hc, two);
+  eq(body2.length, 131072, '131038: two records of 65536 bytes');
+  eq((await openKatRecord(body2.subarray(0, 65536), 0))[65519], 0x01, '131038: record 0 delimiter');
+  eq((await openKatRecord(body2.subarray(65536), 1))[65519], 0x02, '131038: record 1 delimiter');
+  sameBytes(await C.decryptRecords(KAT.fileKey, hc, body2, 131038), two, '131038: plaintext');
+});
+
+async function threeRecordFile() {
+  const header = randomHeaderCore();
+  const fileKey = C.generateFileKey();
+  const size = 2 * 65519 + 1000;
+  const body = await C.encryptRecords(fileKey, header, randomBytes(size));
+  eq(body.length, 2 * 65536 + 1017, 'three-record body length');
+  return { header, fileKey, size, body };
+}
+
+// Dropping whole records: every remaining record still authenticates under the
+// right key, nonce and AAD, so only the final delimiter can reject. The size
+// passed is the real one, as metadata would supply; the error MUST be
+// 'truncated', not 'size-mismatch', or the delimiter path is not what caught it.
+test('records: FAIL when the final record of a 3-record file is dropped entirely', async () => {
+  const { header, fileKey, size, body } = await threeRecordFile();
+  await rejects(() => C.decryptRecords(fileKey, header, body.subarray(0, 2 * 65536), size),
+    'records 0 and 1 of 3', 'truncated');
+});
+
+test('records: FAIL when the final two records of a 3-record file are dropped', async () => {
+  const { header, fileKey, size, body } = await threeRecordFile();
+  await rejects(() => C.decryptRecords(fileKey, header, body.subarray(0, 65536), size),
+    'record 0 of 3', 'truncated');
+});
+
+test('records: FAIL when a 2-record file is truncated to its first record', async () => {
+  const header = randomHeaderCore();
+  const fileKey = C.generateFileKey();
+  const size = 65519 + 1000;
+  const body = await C.encryptRecords(fileKey, header, randomBytes(size));
+  eq(body.length, 65536 + 1017, 'two-record body length');
+  await rejects(() => C.decryptRecords(fileKey, header, body.subarray(0, 65536), size),
+    'record 0 of 2', 'truncated');
+});
+
+test('records: FAIL when bytes are cut from the final record', async () => {
+  const { header, fileKey, size, body } = await threeRecordFile();
+  await rejects(() => C.decryptRecords(fileKey, header, body.subarray(0, body.length - 1), size),
+    'final record missing one byte', 'corrupt');
+  await rejects(() => C.decryptRecords(fileKey, header, body.subarray(0, 2 * 65536 + 16), size),
+    'final record shorter than 17 bytes', 'malformed');
+});
+
+test('records: FAIL when two records are swapped', async () => {
+  const { header, fileKey, size, body } = await threeRecordFile();
+  const r0 = body.subarray(0, 65536), r1 = body.subarray(65536, 131072), r2 = body.subarray(131072);
+  await rejects(() => C.decryptRecords(fileKey, header, join(r1, r0, r2), size), 'records 0 and 1 swapped', 'corrupt');
+  const small = await C.encryptRecords(fileKey, header, randomBytes(65519 + 5));
+  const s0 = small.subarray(0, 65536), s1 = small.subarray(65536);
+  await rejects(() => C.decryptRecords(fileKey, header, join(s1, s0), 65524), 'final record moved first', 'corrupt');
+});
+
+test('records: FAIL when the header is altered after encryption', async () => {
+  const { header, fileKey, size, body } = await threeRecordFile();
+  const fields = { flags: 1, salt: 2, expires_at: 25, max_downloads: 29, metadata_ct: 300, 'last byte': 557 };
+  for (const [field, offset] of Object.entries(fields)) {
+    const altered = header.slice(); altered[offset] ^= 0x01;
+    await rejects(() => C.decryptRecords(fileKey, altered, body, size), `${field} altered`, 'corrupt');
+  }
+  const version = header.slice(); version[0] = 0x02;
+  await rejects(() => C.decryptRecords(fileKey, version, body, size), 'version altered', 'unknown-version');
+});
+
+test('records: reject a blob claiming more than 1601 records, before decrypting', async () => {
+  const header = randomHeaderCore();
+  const fileKey = C.generateFileKey();
+  const big = new Uint8Array(1601 * 65536 + 1);
+  await rejects(() => C.decryptRecords(fileKey, header, big, 0), '1602 records', 'too-many-records');
+  await rejects(() => C.decryptRecords(fileKey, header, big.subarray(0, 1601 * 65536), 0),
+    '1601 records is within the bound (fails later, on authentication)', 'corrupt');
+  await rejects(() => C.encryptRecords(fileKey, header, big.subarray(0, 104857601)),
+    'encrypting 100 MiB + 1 byte', 'too-large');
+});
+
+test('records: wrong delimiters, empty body and length mismatch rejected', async () => {
+  const hc = katHeaderCore();
+  const full = (delimiter) => { const p = new Uint8Array(65520); p[65519] = delimiter; return p; };
+  const finalRecord = await sealKatRecord(new Uint8Array([7, 0x02]), 1);
+
+  const early = join(await sealKatRecord(full(0x02), 0), finalRecord);
+  await rejects(() => C.decryptRecords(KAT.fileKey, hc, early, 65520), 'non-final record ends 0x02', 'corrupt');
+  const zero = join(await sealKatRecord(full(0x01), 0), await sealKatRecord(new Uint8Array([7, 0x00]), 1));
+  await rejects(() => C.decryptRecords(KAT.fileKey, hc, zero, 65520), 'final record ends 0x00', 'corrupt');
+  const valid = join(await sealKatRecord(full(0x01), 0), finalRecord);
+  eq((await C.decryptRecords(KAT.fileKey, hc, valid, 65520)).length, 65520, 'hand-sealed valid file decrypts');
+
+  await rejects(() => C.decryptRecords(KAT.fileKey, hc, new Uint8Array(0), 0), 'empty body', 'malformed');
+  await rejects(() => C.decryptRecords(KAT.fileKey, hc, valid, 65519), 'size one less than decrypted', 'size-mismatch');
+  await rejects(() => C.decryptRecords(KAT.fileKey, hc, valid, 65521), 'size one more than decrypted', 'size-mismatch');
+});
+
+// ---- §7 metadata ----------------------------------------------------------
+
+function headerPrefixOf(flags, salt, expiresAt, maxDownloads) {
+  const p = new Uint8Array(30);
+  p[0] = 0x01; p[1] = flags;
+  p.set(salt, 2);
+  const dv = new DataView(p.buffer);
+  dv.setBigUint64(18, BigInt(expiresAt)); dv.setUint32(26, maxDownloads);
+  return p;
+}
+function jsonBytes(meta) { return new TextEncoder().encode(JSON.stringify(meta)); }
+// Seals and opens metadata plaintext directly with WebCrypto, independent of
+// crypto.js's metadata code, so tests can write what no encoder would.
+async function metadataCipher(fileKey, salt, iv) {
+  const key = await crypto.subtle.importKey('raw', await C.hkdf(fileKey, salt, 'sunbird/v1/metadata', 32),
+    'AES-GCM', false, ['encrypt', 'decrypt']);
+  iv = iv ?? await C.hkdf(fileKey, salt, 'sunbird/v1/metadata-nonce', 12);
+  return {
+    seal: async (prefix, plaintext) => new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: prefix }, key, plaintext)),
+    open: async (prefix, ct) => new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv, additionalData: prefix }, key, ct)),
+  };
+}
+function metadataPlaintext(json) {
+  const p = new Uint8Array(512);
+  p[0] = json.length >> 8; p[1] = json.length & 0xff;
+  p.set(json, 2);
+  return p;
+}
+// A name whose JSON, with type 'text/plain' and the given size, is exactly
+// `bytes` long: Devanagari (3 UTF-8 bytes per UTF-16 unit) topped up with ASCII.
+function nameOfJsonBytes(bytes, size) {
+  const base = jsonBytes({ name: '', type: 'text/plain', size }).length;
+  const room = bytes - base;
+  return 'क'.repeat(Math.floor(room / 3)) + 'a'.repeat(room % 3);
+}
+
+test('metadata KAT: metadata_key, metadata_iv and the whole metadata_ct match the independent implementation', async () => {
+  eq(await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/metadata', 32), unhex(KAT.metadataKey), 'metadata_key');
+  eq(await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/metadata-nonce', 12), unhex(KAT.metadataIv), 'metadata_iv');
+  const prefix = headerPrefixOf(0, KAT.salt, 1790000000, 1);
+  eq(prefix, unhex(KAT.headerPrefix), 'header_prefix');
+  const ct = await C.encryptMetadata(KAT.fileKey, prefix, KAT.metadata);
+  eq(ct.length, 528, 'metadata_ct length');
+  eq(ct, unhex(KAT.metadataCt), 'metadata_ct');
+  const got = await C.decryptMetadata(KAT.fileKey, join(prefix, unhex(KAT.metadataCt)));
+  eq(JSON.stringify(got), JSON.stringify(KAT.metadata), 'decrypted from the vector');
+});
+
+test('metadata (§7): round trip a Devanagari filename, and one whose JSON is exactly 510 bytes', async () => {
+  const fileKey = C.generateFileKey();
+  const salt = C.generateSalt();
+  const prefix = headerPrefixOf(C.FLAG_PASSPHRASE, salt, 1790000000, 3);
+  const cipher = await metadataCipher(fileKey, salt);
+
+  const hindi = { name: 'रिपोर्ट १.pdf', type: 'application/pdf', size: 104857600 };
+  const got = await C.decryptMetadata(fileKey, join(prefix, await C.encryptMetadata(fileKey, prefix, hindi)));
+  eq(JSON.stringify(got), JSON.stringify(hindi), 'Devanagari name');
+
+  const name = nameOfJsonBytes(510, 42);
+  if (name.length >= 510) throw new Error('name is not shorter in characters than in bytes: this test would prove nothing');
+  const ct = await C.encryptMetadata(fileKey, prefix, { name, type: 'text/plain', size: 42 });
+  const plaintext = await cipher.open(prefix, ct);
+  eq((plaintext[0] << 8) | plaintext[1], 510, 'json_len');
+  const back = await C.decryptMetadata(fileKey, join(prefix, ct));
+  eq(back.name, name, '510-byte name');
+  eq(back.size, 42, 'size');
+});
+
+test('metadata (§7): reject at 511 encoded bytes — by bytes, not characters; never truncated', async () => {
+  const fileKey = C.generateFileKey();
+  const prefix = headerPrefixOf(0, C.generateSalt(), 1790000000, 1);
+  const name = nameOfJsonBytes(511, 42);
+  eq(jsonBytes({ name, type: 'text/plain', size: 42 }).length, 511, 'encoded length');
+  const err = await rejects(() => C.encryptMetadata(fileKey, prefix, { name, type: 'text/plain', size: 42 }),
+    `511-byte JSON from a ${name.length}-character name`, 'name-too-long');
+  if (!/name is too long/.test(err.message)) throw new Error(`message does not say the name is too long: ${err.message}`);
+  // JSON escaping counts: 100 control characters are 100 UTF-16 units and 600 bytes.
+  await rejects(() => C.encryptMetadata(fileKey, prefix, { name: ''.repeat(100), type: '', size: 0 }),
+    'name that escaping expands past 510', 'name-too-long');
+});
+
+test('metadata (§7): reject a non-zero byte in the zero fill, and json_len over 510', async () => {
+  const fileKey = C.generateFileKey();
+  const salt = C.generateSalt();
+  const prefix = headerPrefixOf(0, salt, 1790000000, 1);
+  const cipher = await metadataCipher(fileKey, salt);
+  const json = jsonBytes({ name: 'a.txt', type: 'text/plain', size: 1 });
+
+  const clean = metadataPlaintext(json);
+  eq((await C.decryptMetadata(fileKey, join(prefix, await cipher.seal(prefix, clean)))).name, 'a.txt', 'clean fill accepted');
+  for (const at of [2 + json.length, 300, 511]) {
+    const dirty = clean.slice(); dirty[at] = 0x01;
+    await rejects(async () => C.decryptMetadata(fileKey, join(prefix, await cipher.seal(prefix, dirty))),
+      `non-zero fill byte at ${at}`, 'malformed');
+  }
+  const long = clean.slice(); long[0] = 0x01; long[1] = 0xff; // 511
+  await rejects(async () => C.decryptMetadata(fileKey, join(prefix, await cipher.seal(prefix, long))), 'json_len 511', 'malformed');
+});
+
+test('metadata (§7): an unknown JSON key is ignored, and not returned', async () => {
+  const fileKey = C.generateFileKey();
+  const salt = C.generateSalt();
+  const prefix = headerPrefixOf(0, salt, 1790000000, 1);
+  const cipher = await metadataCipher(fileKey, salt);
+  const json = jsonBytes({ name: 'a.txt', future: { nested: [1, 2] }, type: 'text/plain', size: 7, html: '<b>x</b>' });
+  const got = await C.decryptMetadata(fileKey, join(prefix, await cipher.seal(prefix, metadataPlaintext(json))));
+  eq(JSON.stringify(got), '{"name":"a.txt","type":"text/plain","size":7}', 'returned fields');
+  if (!Object.isFrozen(got)) throw new Error('returned metadata is not frozen');
+});
+
+test('metadata (§7): a duplicated key — the last occurrence wins, and the kind rules apply to it', async () => {
+  const fileKey = C.generateFileKey();
+  const salt = C.generateSalt();
+  const prefix = headerPrefixOf(0, salt, 1790000000, 1);
+  const cipher = await metadataCipher(fileKey, salt);
+  const open = async (text) => C.decryptMetadata(fileKey,
+    join(prefix, await cipher.seal(prefix, metadataPlaintext(new TextEncoder().encode(text)))));
+  const got = await open('{"name":"first.txt","size":"x","type":"text/plain","name":"last.txt","size":7}');
+  eq(JSON.stringify(got), '{"name":"last.txt","type":"text/plain","size":7}', 'last values used');
+  await rejects(() => open('{"name":"a.txt","type":"text/plain","size":7,"size":"x"}'),
+    'a valid size followed by an invalid one', 'malformed');
+});
+
+test('metadata (§7): MUST fail after any change to header_prefix — flags, expires_at, max_downloads', async () => {
+  const fileKey = C.generateFileKey();
+  const salt = C.generateSalt();
+  const prefix = headerPrefixOf(C.FLAG_PASSPHRASE, salt, 1790000000, 1);
+  const ct = await C.encryptMetadata(fileKey, prefix, { name: 'a.txt', type: 'text/plain', size: 1 });
+  eq((await C.decryptMetadata(fileKey, join(prefix, ct))).size, 1, 'unaltered header decrypts');
+
+  const altered = {
+    'passphrase flag cleared': headerPrefixOf(0, salt, 1790000000, 1),
+    'expires_at extended by one second': headerPrefixOf(C.FLAG_PASSPHRASE, salt, 1790000001, 1),
+    'expires_at high byte set': headerPrefixOf(C.FLAG_PASSPHRASE, salt, 1790000000n + (1n << 56n), 1),
+    'max_downloads 1 → 0 (unlimited)': headerPrefixOf(C.FLAG_PASSPHRASE, salt, 1790000000, 0),
+    'max_downloads 1 → 2': headerPrefixOf(C.FLAG_PASSPHRASE, salt, 1790000000, 2),
+  };
+  for (const [why, p] of Object.entries(altered)) {
+    await rejects(() => C.decryptMetadata(fileKey, join(p, ct)), why, 'corrupt');
+  }
+  const version = prefix.slice(); version[0] = 0x02;
+  await rejects(() => C.decryptMetadata(fileKey, join(version, ct)), 'version altered', 'unknown-version');
+  await rejects(() => C.decryptMetadata(C.generateFileKey(), join(prefix, ct)), 'another file_key', 'corrupt');
+});
+
+test('metadata (§7): the IV is neither all-zero nor nonce_base — metadata_ct opens only under the derived IV', async () => {
+  const prefix = unhex(KAT.headerPrefix);
+  const ct = await C.encryptMetadata(KAT.fileKey, prefix, KAT.metadata);
+  const iv = await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/metadata-nonce', 12);
+  const nonceBase = await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/content-nonce', 12);
+  ne(iv, new Uint8Array(12), 'metadata_iv vs all-zero');
+  ne(iv, nonceBase, 'metadata_iv vs nonce_base');
+  ne(await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/metadata', 32),
+    await C.hkdf(KAT.fileKey, KAT.salt, 'sunbird/v1/content', 32), 'metadata_key vs content_key');
+
+  await (await metadataCipher(KAT.fileKey, KAT.salt)).open(prefix, ct); // derived IV: opens
+  await rejects(async () => (await metadataCipher(KAT.fileKey, KAT.salt, new Uint8Array(12))).open(prefix, ct), 'all-zero IV');
+  await rejects(async () => (await metadataCipher(KAT.fileKey, KAT.salt, nonceBase)).open(prefix, ct), 'nonce_base as IV');
+});
+
+test('metadata (§7): not UTF-8, a BOM, not an object, or a defined key of the wrong kind — malformed', async () => {
+  const fileKey = C.generateFileKey();
+  const salt = C.generateSalt();
+  const prefix = headerPrefixOf(0, salt, 1790000000, 1);
+  const cipher = await metadataCipher(fileKey, salt);
+  const open = async (json) => C.decryptMetadata(fileKey, join(prefix, await cipher.seal(prefix, metadataPlaintext(json))));
+  const text = (s) => new TextEncoder().encode(s);
+
+  const bad = {
+    'invalid UTF-8': join(text('{"name":"'), new Uint8Array([0xc3, 0x28]), text('","type":"","size":1}')),
+    'byte-order mark': join(new Uint8Array([0xef, 0xbb, 0xbf]), text('{"name":"a","type":"","size":1}')),
+    'array': text('["a","",1]'),
+    'null': text('null'),
+    'not JSON': text('{name:"a"}'),
+    'name a number': text('{"name":1,"type":"","size":1}'),
+    'name missing': text('{"type":"","size":1}'),
+    'type null': text('{"name":"a","type":null,"size":1}'),
+    'size a string': text('{"name":"a","type":"","size":"1"}'),
+    'size -1': text('{"name":"a","type":"","size":-1}'),
+    'size 2.5': text('{"name":"a","type":"","size":2.5}'),
+    'size 2^53': text('{"name":"a","type":"","size":9007199254740992}'),
+    'size missing': text('{"name":"a","type":""}'),
+  };
+  for (const [why, json] of Object.entries(bad)) await rejects(() => open(json), why, 'malformed');
+
+  eq((await open(text('{"name":"a","type":"","size":3.0}'))).size, 3, 'size 3.0 is the integer 3');
+  eq((await open(text('{"name":"a","type":"","size":9007199254740991}'))).size, 9007199254740991, 'size 2^53−1');
+});
+
+// ---- §10 procedures -------------------------------------------------------
+
+async function bytesOf(blob) { return new Uint8Array(await blob.arrayBuffer()); }
+
+test('file (§10): encryptFile → parseHeader → unlockFile → decryptFile, restricted and public', async () => {
+  for (const passphrase of ['päss', undefined]) {
+    const plaintext = randomBytes(65519 + 77);
+    const { fragment, blob } = await C.encryptFile(plaintext, {
+      name: 'résumé.pdf', type: 'application/pdf', passphrase, expiresAt: 1790000000, maxDownloads: 0 });
+    const bytes = await bytesOf(blob);
+    const preview = C.parseHeader(bytes.subarray(0, 8192));
+    eq(preview.flags, passphrase ? 1 : 0, 'flags');
+    eq(String(preview.expiresAt), '1790000000', 'expiresAt');
+    eq(preview.maxDownloads, 0, 'maxDownloads 0 (no limit)');
+    eq(bytes.length, 622 + 65536 + 77 + 17, 'blob length');
+    const fileKey = await C.unlockFile(preview, C.decodeFragment(fragment), passphrase);
+    const { metadata, plaintext: out } = await C.decryptFile(fileKey, preview, bytes);
+    eq(metadata.name, 'résumé.pdf', 'name');
+    sameBytes(out, plaintext, `plaintext (${passphrase ? 'restricted' : 'public'})`);
+  }
+});
+
+// Every use of Argon2id goes through hash-wasm's argon2id. Counting the calls
+// is how a test knows whether it ran, rather than guessing from elapsed time.
+test('progress (§10): "passphrase" before any record, restricted only; records counted 1..n sealing and opening', async () => {
+  const plaintext = pattern(3 * 65519 + 5); // 4 records
+  for (const passphrase of [undefined, 'p']) {
+    const kind = passphrase ? 'restricted' : 'public';
+    const sealed = [];
+    const { fragment, blob } = await C.encryptFile(plaintext, {
+      name: 'a', type: '', passphrase, expiresAt: 1790000000, maxDownloads: 1,
+      onProgress: (p) => sealed.push(p.stage === 'records' ? `${p.done}/${p.total}` : p.stage),
+    });
+    eq(sealed.join(' '), `${passphrase ? 'passphrase ' : ''}1/4 2/4 3/4 4/4`, `${kind}: sealing`);
+    const bytes = await bytesOf(blob);
+    const preview = C.parseHeader(bytes.subarray(0, 8192));
+    const fileKey = await C.unlockFile(preview, C.decodeFragment(fragment), passphrase);
+    const opened = [];
+    const { plaintext: back } = await C.decryptFile(fileKey, preview, bytes, (p) => opened.push(`${p.stage} ${p.done}/${p.total}`));
+    eq(opened.join(', '), 'records 1/4, records 2/4, records 3/4, records 4/4', `${kind}: opening`);
+    sameBytes(back, plaintext, `${kind}: plaintext`);
+  }
+});
+
+async function argon2Calls(fn) {
+  const real = hashwasm.argon2id;
+  let calls = 0;
+  hashwasm.argon2id = (...args) => { calls++; return real(...args); };
+  try {
+    await fn();
+  } finally {
+    hashwasm.argon2id = real;
+  }
+  return calls;
+}
+
+test('public mode (§4.2, D4): a file round-trips and Argon2id is never called; restricted calls it once each way', async () => {
+  for (const [passphrase, want] of [[undefined, 0], ['päss', 1]]) {
+    const mode = passphrase ? 'restricted' : 'public';
+    const plaintext = randomBytes(65519 + 5);
+    let sealed;
+    eq(await argon2Calls(async () => {
+      sealed = await C.encryptFile(plaintext, { name: 'p.txt', type: 'text/plain', passphrase, expiresAt: 1790000000, maxDownloads: 1 });
+    }), want, `${mode}: Argon2id calls to encrypt`);
+    const bytes = await bytesOf(sealed.blob);
+    let out;
+    eq(await argon2Calls(async () => {
+      const preview = C.parseHeader(bytes.subarray(0, 8192));
+      const fileKey = await C.unlockFile(preview, C.decodeFragment(sealed.fragment), passphrase);
+      out = (await C.decryptFile(fileKey, preview, bytes)).plaintext;
+    }), want, `${mode}: Argon2id calls to open`);
+    sameBytes(out, plaintext, `${mode}: plaintext`);
+  }
+});
+
+test('restricted (§4.2): the wrong passphrase fails; the same bytes opened as public — flags bit 0 cleared — fail too', async () => {
+  const { fragment, blob } = await C.encryptFile(randomBytes(3000),
+    { name: 'r.txt', type: 'text/plain', passphrase: 'right', expiresAt: 1790000000, maxDownloads: 1 });
+  const bytes = await bytesOf(blob);
+  const secret = C.decodeFragment(fragment);
+  const preview = C.parseHeader(bytes);
+  await rejects(() => C.unlockFile(preview, secret, 'wrong'), 'wrong passphrase', 'wrong-passphrase');
+
+  const cleared = bytes.slice(); cleared[1] = 0x00;
+  const asPublic = C.parseHeader(cleared);
+  eq(asPublic.flags, 0, 'flags as sent');
+  await rejects(() => C.unlockFile(asPublic, secret), 'opened as public: the fragment alone', 'wrong-passphrase');
+  // Even with the real file_key the cleared header does not open: the flag is metadata AAD (§7).
+  const fileKey = await C.unlockFile(preview, secret, 'right');
+  await rejects(() => C.decryptFile(fileKey, asPublic, cleared), 'cleared header with the real file_key', 'corrupt');
+});
+
+test('file (§10): refusals before any work — too large, empty passphrase, name too long', async () => {
+  const opts = { name: 'a', type: '', expiresAt: 1790000000, maxDownloads: 1 };
+  await rejects(() => C.encryptFile(new Uint8Array(104857601), opts), '100 MiB + 1', 'too-large');
+  await rejects(() => C.encryptFile(new Uint8Array(1), { ...opts, passphrase: '' }), 'empty passphrase', 'empty-passphrase');
+  const start = performance.now();
+  await rejects(() => C.encryptFile(new Uint8Array(1), { ...opts, passphrase: 'x', name: 'n'.repeat(600) }),
+    'name too long, with a passphrase', 'name-too-long');
+  if (performance.now() - start >= 100) throw new Error('name-too-long took long enough to have run Argon2id');
+  const preview = C.parseHeader(await bytesOf((await C.encryptFile(new Uint8Array(1), { ...opts, passphrase: 'x' })).blob));
+  await rejects(() => C.unlockFile(preview, C.generateFragmentSecret(), ''), 'empty passphrase to unlock', 'empty-passphrase');
+});
+
+test('file (§7): downloaded header_core must equal the preview; a slot grown since still decrypts', async () => {
+  const plaintext = randomBytes(3000);
+  const { fragment, blob } = await C.encryptFile(plaintext, { name: 'a', type: '', expiresAt: 1790000000, maxDownloads: 1 });
+  const bytes = await bytesOf(blob);
+  const preview = C.parseHeader(bytes);
+  const fileKey = await C.unlockFile(preview, C.decodeFragment(fragment));
+
+  const grown = join(bytes.subarray(0, 558), new Uint8Array([2]), bytes.subarray(559, 622),
+    new Uint8Array([0x7f, 0, 4, 9, 9, 9, 9]), bytes.subarray(622));
+  sameBytes((await C.decryptFile(fileKey, preview, grown)).plaintext, plaintext, 'grown slot');
+
+  for (const at of [1, 25, 29, 300, 557]) {
+    const changed = bytes.slice(); changed[at] ^= 0x01;
+    const err = await rejects(() => C.decryptFile(fileKey, preview, changed), `downloaded byte ${at} changed`, 'corrupt');
+    if (!/does not match its preview/.test(err.message)) throw new Error(`byte ${at}: wrong reason: ${err.message}`);
+  }
+  const truncated = bytes.subarray(0, bytes.length - 1);
+  await rejects(() => C.decryptFile(fileKey, preview, truncated), 'blob one byte short', 'corrupt');
+});
+
+// ---- §3.1 parseHeader -----------------------------------------------------
+
+async function realHeader() {
+  const secret = C.generateFragmentSecret();
+  const salt = C.generateSalt();
+  const fileKey = C.generateFileKey();
+  const prefix = headerPrefixOf(0, salt, 1790000000, 5);
+  const headerCore = join(prefix, await C.encryptMetadata(fileKey, prefix, { name: 'a.txt', type: 'text/plain', size: 3 }));
+  const wrappingKey = await publicWrappingKey(secret, salt);
+  const header = join(headerCore, slotOf(await C.wrapFileKey(wrappingKey, fileKey)));
+  return { salt, fileKey, wrappingKey, headerCore, header };
+}
+
+test('parseHeader (§3.1): fields, the exact slot and header length, from a preview that runs into the records', async () => {
+  const { salt, fileKey, wrappingKey, headerCore, header } = await realHeader();
+  const body = await C.encryptRecords(fileKey, headerCore, pattern(3));
+  const blob = join(header, body);
+
+  for (const [why, bytes] of [['short blob, whole', blob], ['exactly the header', header], ['over 8 KiB of bytes', join(header, randomBytes(10000))]]) {
+    const h = C.parseHeader(bytes);
+    eq(h.version, 1, `${why}: version`);
+    eq(h.flags, 0, `${why}: flags`);
+    eq(h.salt, salt, `${why}: salt`);
+    eq(typeof h.expiresAt, 'bigint', `${why}: expiresAt type`);
+    eq(String(h.expiresAt), '1790000000', `${why}: expiresAt`);
+    eq(h.maxDownloads, 5, `${why}: maxDownloads`);
+    eq(h.metadataCt, headerCore.subarray(30), `${why}: metadataCt`);
+    eq(h.headerCore, headerCore, `${why}: headerCore`);
+    eq(h.headerLength, 622, `${why}: headerLength`);
+    eq(h.slot, header.subarray(558), `${why}: slot`);
+  }
+  // The pieces fit the rest of the API with no arithmetic in between.
+  const h = C.parseHeader(blob);
+  eq(await C.unwrapSlot(wrappingKey, h.slot), fileKey, 'unwrapSlot accepts the slot');
+  const meta = await C.decryptMetadata(fileKey, h.headerCore);
+  eq(await C.decryptRecords(fileKey, h.headerCore, blob.subarray(h.headerLength), meta.size), pattern(3), 'records');
+  const maxed = header.slice(); new DataView(maxed.buffer).setBigUint64(18, 0xffffffffffffffffn);
+  eq(String(C.parseHeader(maxed).expiresAt), '18446744073709551615', 'u64 max expiresAt, unrounded');
+});
+
+test('parseHeader (§3.1): rejects entry_count 0 and 65; accepts 64', async () => {
+  const { headerCore } = await realHeader();
+  const errZero = await rejects(() => C.parseHeader(join(headerCore, new Uint8Array([0]), randomBytes(100))), 'entry_count 0', 'malformed');
+  const tooMany = slotOf(...Array.from({ length: 65 }, () => entryOf(0x7f, 0)));
+  await rejects(() => C.parseHeader(join(headerCore, tooMany)), 'entry_count 65', 'malformed');
+  const max = slotOf(...Array.from({ length: 64 }, () => entryOf(0x7f, 0)));
+  eq(C.parseHeader(join(headerCore, max, randomBytes(50))).headerLength, 558 + 1 + 64 * 3, '64 entries');
+  if (!/entries/.test(errZero.message)) throw new Error(`wrong reason: ${errZero.message}`);
+});
+
+test('parseHeader (§3.1): rejects a header over 8 KiB; accepts exactly 8 KiB', async () => {
+  const { headerCore } = await realHeader();
+  const over = join(headerCore, slotOf(entryOf(0x7f, 8192 - 558 - 1 - 3 + 1)));
+  eq(over.length, 8193, 'oversized header length');
+  const err = await rejects(() => C.parseHeader(over), 'header of 8193 bytes, all held', 'malformed');
+  if (!/8 KiB/.test(err.message)) throw new Error(`wrong reason: ${err.message}`);
+  await rejects(() => C.parseHeader(over.subarray(0, 8192)), 'header of 8193 bytes, preview of 8192', 'malformed');
+  const second = join(headerCore, new Uint8Array([2]), entryOf(0x7f, 7000), entryOf(0x7f, 1000));
+  await rejects(() => C.parseHeader(second), 'second entry crosses 8 KiB', 'malformed');
+  const exact = join(headerCore, slotOf(entryOf(0x7f, 8192 - 558 - 1 - 3)), randomBytes(500));
+  eq(C.parseHeader(exact).headerLength, 8192, 'exactly 8 KiB');
+});
+
+test('parseHeader (§3.1): rejects an entry whose length runs past the bytes held', async () => {
+  const { header } = await realHeader();
+  const err = await rejects(() => C.parseHeader(header.subarray(0, 621)), 'last byte of the only entry missing', 'malformed');
+  if (!/past the end of the bytes held/.test(err.message)) throw new Error(`wrong reason: ${err.message}`);
+  await rejects(() => C.parseHeader(header.subarray(0, 561)), 'entry type and length cut short', 'malformed');
+  const lying = header.slice(); lying[560] = 0xff; // length 0x00ff: 255 bytes, 60 held
+  await rejects(() => C.parseHeader(lying), 'length field larger than the bytes after it', 'malformed');
+});
+
+test('parseHeader (§3.1, §9): unknown version, reserved flags and a header with no slot rejected', async () => {
+  const { header } = await realHeader();
+  const v2 = header.slice(); v2[0] = 0x02;
+  await rejects(() => C.parseHeader(v2), 'version 0x02', 'unknown-version');
+  await rejects(() => C.parseHeader(new Uint8Array([0x02])), 'one byte of version 0x02', 'unknown-version');
+  for (const flags of [0x02, 0x80]) {
+    const f = header.slice(); f[1] = flags;
+    await rejects(() => C.parseHeader(f), `flags 0x${flags.toString(16)}`, 'malformed');
+  }
+  await rejects(() => C.parseHeader(header.subarray(0, 558)), 'header_core only', 'malformed');
+  await rejects(() => C.parseHeader(new Uint8Array(0)), 'no bytes', 'malformed');
+});
+
+// ---- runner ---------------------------------------------------------------
+
+(async () => {
+  const list = document.getElementById('results');
+  const summary = document.getElementById('summary');
+  let failed = 0;
+  for (const { name, fn } of tests) {
+    const li = document.createElement('li');
+    const start = performance.now();
+    try {
+      await fn();
+      li.className = 'pass';
+      li.textContent = `${name}  (${Math.round(performance.now() - start)} ms)`;
+    } catch (err) {
+      failed++;
+      li.className = 'fail';
+      li.textContent = `${name}\n      ${err.message}`;
+    }
+    list.appendChild(li);
+  }
+  summary.dataset.status = failed ? 'fail' : 'pass';
+  summary.textContent = failed
+    ? `${failed} of ${tests.length} tests failed`
+    : `All ${tests.length} tests passed`;
+})();
+</script>

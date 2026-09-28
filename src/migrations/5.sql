@@ -1,0 +1,4 @@
+CREATE TABLE counters (
+		name  TEXT PRIMARY KEY,
+		value INTEGER NOT NULL
+	 ) STRICT;
