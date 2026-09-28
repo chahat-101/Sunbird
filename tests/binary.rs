@@ -7,6 +7,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
+/// The one member's upload token; the config holds only its hash.
+const TOKEN: &str = "binary-test-token";
+
+fn config() -> String {
+    let hash: String = Sha256::digest(TOKEN)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!(
+        r#"{{"members": [{{"id": "AAAAAAAAAAAAAAAAAAAAAA", "name": "m", "token_sha256": "{hash}",
+             "max_active_bytes": 1000000000, "max_active_files": 1000, "max_bytes_per_week": 1000000000}}],
+            "admins": [], "trusted_proxies": [],
+            "upload_rate": {{"requests": 1000, "seconds": 1}}, "read_rate": {{"requests": 1000, "seconds": 1}}}}"#
+    )
+}
+
 struct Running {
     child: Child,
     dir: PathBuf,
@@ -33,6 +51,7 @@ fn start_with(prepare: impl FnOnce(&Path)) -> Running {
         std::thread::current().id()
     ));
     std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("sunbird.json"), config()).unwrap();
     prepare(&dir.join("data"));
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -41,7 +60,7 @@ fn start_with(prepare: impl FnOnce(&Path)) -> Running {
         .port();
     let addr = format!("127.0.0.1:{port}");
     let child = Command::new(env!("CARGO_BIN_EXE_sunbird"))
-        .args(["-addr", &addr, "-data", "data"])
+        .args(["-addr", &addr, "-data", "data", "-config", "sunbird.json"])
         .current_dir(&dir)
         .stderr(Stdio::null())
         .spawn()
@@ -95,7 +114,7 @@ fn declared_length_over_max_blob_refused_before_the_body() {
         &s.addr,
         &format!(
             "POST /api/upload?expires_at={expires}&max_downloads=0 HTTP/1.1\r\nHost: x\r\n\
-             Content-Length: 104931329\r\nExpect: 100-continue\r\n\r\n"
+             Authorization: Bearer {TOKEN}\r\nContent-Length: 104931329\r\nExpect: 100-continue\r\n\r\n"
         ),
     );
     assert!(response.starts_with("HTTP/1.1 413"), "{response}");
@@ -115,7 +134,8 @@ fn declared_length_over_max_blob_refused_before_the_body() {
     let response = exchange(
         &s.addr,
         &format!(
-            "POST /api/upload?expires_at={expires}&max_downloads=0 HTTP/1.1\r\nHost: x\r\nContent-Length: 9223372036854775807\r\n\r\n"
+            "POST /api/upload?expires_at={expires}&max_downloads=0 HTTP/1.1\r\nHost: x\r\n\
+             Authorization: Bearer {TOKEN}\r\nContent-Length: 9223372036854775807\r\n\r\n"
         ),
     );
     assert!(response.starts_with("HTTP/1.1 413"), "{response}");
@@ -169,4 +189,61 @@ fn sweeps_at_startup() {
         )
         .unwrap();
     assert_eq!(rows, 0, "the expired row");
+}
+
+/// Without a config the server does not start: it has no members, and no
+/// limits of its own to fall back on.
+#[test]
+fn refuses_to_start_without_a_config() {
+    let dir = std::env::temp_dir().join(format!("sunbird-binary-noconfig-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_sunbird"))
+        .args(["-addr", "127.0.0.1:0", "-data", "data"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.status.success(), "started with no config");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("sunbird.json"), "{err}");
+}
+
+/// mint-token prints a 128-bit base64url token once, and the SHA-256 that
+/// goes in the config; mint-id prints an id, and nothing about a token.
+#[test]
+fn mints_tokens_and_ids() {
+    let run = |sub: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_sunbird"))
+            .arg(sub)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{sub}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let out = run("mint-token");
+    let field = |name: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let (token, hash) = (field("token:"), field("token_sha256:"));
+    let alphabet = |s: &str| {
+        s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    };
+    assert!(token.len() == 22 && alphabet(&token), "token {token}");
+    let want: String = Sha256::digest(&token)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(hash, want);
+    assert!(field("token:") != field("token_sha256:"));
+    assert!(run("mint-token") != out, "two tokens alike");
+
+    let id = run("mint-id");
+    let id = id.trim();
+    assert!(id.len() == 22 && alphabet(id), "id {id}");
+    assert!(!id.contains("token"));
 }

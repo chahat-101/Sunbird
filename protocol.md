@@ -1,11 +1,9 @@
 # Sunbird — protocol, version 1
 
 This is the wire format. Once links exist it is frozen: changing anything here
-breaks every link already shared. Rationale is in `DECISIONS.md` and in
-`docs/step-00-answers.md`, `-2.md` and `-3.md`. A later round supersedes an
-earlier one where they differ: round 2 on record AAD, the record bound, the
-slot entry layout and commit scope; round 3 on the header hash (the slot is
-excluded), the slot bound, the final-record encoding and the decoder rules.
+breaks every link already shared. Rationale is in `DECISIONS.md`. The design
+rationale for the rounds that settled this format before step 01 lives outside
+this repository.
 Step 01, before any link existed, amended two rules without changing a byte of
 the format: `GET /api/meta/:id` returns raw leading bytes and the server keeps
 no format knowledge (§3, §3.1, §6.4, §10), and unwrapping tries every known

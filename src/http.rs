@@ -3,6 +3,7 @@
 
 use std::fmt::Display;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -15,6 +16,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 use crate::app::{App, FileId, Limits, MAX_BLOB, OwnerToken, PREVIEW_LEN};
+use crate::limit;
 
 pub type Body = BoxBody<Bytes, io::Error>;
 
@@ -26,10 +28,19 @@ pub enum ApiError {
     NotFound,
     NoOwnerToken,
     WrongOwnerToken,
+    /// No upload token, or one no member in the config has.
+    NotAMember,
+    /// No admin token, or one no admin in the config has.
+    NotAnAdmin,
+    /// Retry after this many seconds. The same for a real, a missing and a
+    /// malformed ID: the limiter runs before the ID is looked at.
+    RateLimited(u64),
     BadLimits(&'static str),
     /// The body stopped before it ended: the client went away.
     Incomplete,
     TooLarge,
+    /// The member's quota, with the message naming the limit and when it frees.
+    OverQuota(String),
     /// The cause is logged where it happened; the client gets only this.
     Internal(&'static str),
 }
@@ -38,19 +49,26 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             ApiError::NotFound => StatusCode::NOT_FOUND,
-            ApiError::NoOwnerToken => StatusCode::UNAUTHORIZED,
+            ApiError::NoOwnerToken | ApiError::NotAMember | ApiError::NotAnAdmin => {
+                StatusCode::UNAUTHORIZED
+            }
             ApiError::WrongOwnerToken => StatusCode::FORBIDDEN,
+            ApiError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::BadLimits(_) | ApiError::Incomplete => StatusCode::BAD_REQUEST,
-            ApiError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::TooLarge | ApiError::OverQuota(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
-    fn message(&self) -> &'static str {
+    fn message(&self) -> &str {
         match self {
             ApiError::NotFound => "not found",
             ApiError::NoOwnerToken => "owner token required",
             ApiError::WrongOwnerToken => "wrong owner token",
+            ApiError::NotAMember => "a member's upload token is required",
+            ApiError::NotAnAdmin => "an admin token is required",
+            ApiError::RateLimited(_) => "too many requests",
+            ApiError::OverQuota(why) => why,
             ApiError::BadLimits(why) | ApiError::Internal(why) => why,
             ApiError::Incomplete => "upload did not complete",
             ApiError::TooLarge => "upload is larger than the server accepts",
@@ -58,10 +76,15 @@ impl ApiError {
     }
 
     fn into_response(self) -> Response<Body> {
-        json(
+        let mut res = json(
             self.status(),
             &serde_json::json!({ "error": self.message() }),
-        )
+        );
+        if let ApiError::RateLimited(seconds) = self {
+            res.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        res
     }
 }
 
@@ -79,12 +102,13 @@ fn internal<E: Display>(message: &'static str) -> impl FnOnce(E) -> ApiError {
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-pub async fn handle<B>(app: Arc<App>, req: Request<B>) -> Response<Body>
+/// Answers `req`, which came over a connection from `peer`.
+pub async fn handle<B>(app: Arc<App>, peer: IpAddr, req: Request<B>) -> Response<Body>
 where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Display,
 {
-    let mut res = route(app, req)
+    let mut res = route(app, peer, req)
         .await
         .unwrap_or_else(ApiError::into_response);
     let headers = res.headers_mut();
@@ -104,7 +128,7 @@ where
     res
 }
 
-async fn route<B>(app: Arc<App>, req: Request<B>) -> Result<Response<Body>, ApiError>
+async fn route<B>(app: Arc<App>, peer: IpAddr, req: Request<B>) -> Result<Response<Body>, ApiError>
 where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Display,
@@ -115,13 +139,30 @@ where
     let get = matches!(*req.method(), Method::GET | Method::HEAD);
     match *req.method() {
         Method::POST if path == "/api/upload" => upload(app, req).await,
-        _ if get && path.starts_with("/api/meta/") => {
-            serve(app, &path["/api/meta/".len()..], PREVIEW_LEN, false).await
+        _ if get && (path.starts_with("/api/meta/") || path.starts_with("/api/download/")) => {
+            // Before the ID is so much as parsed, and counting every request
+            // whatever it would get: a refusal is the same bytes for a real,
+            // a missing and a malformed ID, so the limit reveals nothing.
+            let client = limit::client(
+                peer,
+                req.headers().get_all("x-forwarded-for").iter(),
+                &app.config.trusted_proxies,
+            );
+            app.read_limit
+                .check(limit::bucket(client))
+                .map_err(ApiError::RateLimited)?;
+            match path.strip_prefix("/api/meta/") {
+                Some(id) => serve(app, id, PREVIEW_LEN, false).await,
+                None => {
+                    // A HEAD transfers nothing, so it claims nothing.
+                    let claim = req.method() == Method::GET;
+                    serve(app, &path["/api/download/".len()..], MAX_BLOB, claim).await
+                }
+            }
         }
-        _ if get && path.starts_with("/api/download/") => {
-            // A HEAD transfers nothing, so it claims nothing.
-            let claim = req.method() == Method::GET;
-            serve(app, &path["/api/download/".len()..], MAX_BLOB, claim).await
+        Method::DELETE if path.starts_with("/api/admin/") => {
+            let token = bearer(&req).map(str::to_owned);
+            admin_delete(app, &path["/api/admin/".len()..], token).await
         }
         Method::DELETE if path.starts_with("/api/") => {
             let token = bearer(&req).map(str::to_owned);
@@ -151,20 +192,45 @@ async fn blocking<T: Send + 'static>(
 
 // ---- upload -----------------------------------------------------------------
 
-/// Every refusal that can come before the body does: the limits (400), then a
-/// declared length over max_blob (413). Then the body streams to tmp/ and is
-/// cut off at max_blob; nothing is buffered to find its length.
+/// Every refusal that can come before the body does: no member's token (401),
+/// the member's rate (429), the limits (400), then a declared length over
+/// max_blob or over the member's quota (413). Then the body streams to tmp/
+/// and is cut off at the smaller of max_blob and the member's room; nothing is
+/// buffered to find its length. The quota is checked a third time, and
+/// decisively, when the file is saved.
 async fn upload<B>(app: Arc<App>, req: Request<B>) -> Result<Response<Body>, ApiError>
 where
     B: HttpBody<Data = Bytes> + Unpin,
     B::Error: Display,
 {
+    let member = bearer(&req)
+        .and_then(|token| app.config.member(token))
+        .cloned()
+        .ok_or(ApiError::NotAMember)?;
+    app.upload_limit
+        .check(member.id.clone())
+        .map_err(ApiError::RateLimited)?;
     let limits = Limits::parse(req.uri().query(), (app.now)()).map_err(ApiError::BadLimits)?;
     let mut body = req.into_body();
-    // hyper's size hint is the declared Content-Length, exactly.
-    if body.size_hint().lower() > MAX_BLOB {
+    // hyper's size hint is the declared Content-Length, exactly; 0 if none.
+    let declared = body.size_hint().lower();
+    if declared > MAX_BLOB {
         return Err(ApiError::TooLarge);
     }
+    // The first check: the declared length, or with none, whether even an
+    // empty file fits (a member at their file limit is refused here).
+    let usage = blocking(&app, {
+        let id = member.id.clone();
+        move |app| app.usage(&id)
+    })
+    .await
+    .map_err(internal("could not check the quota"))?;
+    let now = (app.now)();
+    member
+        .quota
+        .admit(&usage, declared, now)
+        .map_err(ApiError::OverQuota)?;
+    let room = member.quota.room(&usage);
 
     let tmp = TempFile(app.temp_path());
     let mut file = tokio::fs::File::create_new(&tmp.0)
@@ -183,6 +249,13 @@ where
         if size > MAX_BLOB {
             return Err(ApiError::TooLarge);
         }
+        // The second check, for a body with no length or a false one.
+        if size > room {
+            return Err(match member.quota.admit(&usage, size, now) {
+                Err(why) => ApiError::OverQuota(why),
+                Ok(()) => ApiError::TooLarge,
+            });
+        }
         file.write_all(&data)
             .await
             .map_err(internal("could not store upload"))?;
@@ -198,9 +271,12 @@ where
     let token = OwnerToken::random();
     let owner = token.hash();
     // tmp moves in, so its name is removed only once the link has been made.
-    let id = blocking(&app, move |app| app.commit(&tmp.0, &owner, size, limits))
-        .await
-        .map_err(internal("could not store upload"))?;
+    let id = blocking(&app, move |app| {
+        app.commit(&tmp.0, &owner, size, limits, &member)
+    })
+    .await
+    .map_err(internal("could not store upload"))?
+    .map_err(ApiError::OverQuota)?;
     Ok(json(
         StatusCode::CREATED,
         &serde_json::json!({ "id": id.to_string(), "ownerToken": token.as_str() }),
@@ -385,6 +461,34 @@ async fn delete(
         .expect("valid response"))
 }
 
+/// An admin's deletion: `DELETE /api/admin/<id>` with an admin token. Unlike
+/// the owner's, it reaches a file that has expired or been used up but not yet
+/// swept, and it answers 404 only when there is no row at all.
+async fn admin_delete(
+    app: Arc<App>,
+    id: &str,
+    token: Option<String>,
+) -> Result<Response<Body>, ApiError> {
+    let admin = token
+        .as_deref()
+        .and_then(|token| app.config.admin(token))
+        .cloned()
+        .ok_or(ApiError::NotAnAdmin)?;
+    let id = FileId::parse(id).ok_or(ApiError::NotFound)?;
+    let deleted = blocking(&app, move |app| app.admin_delete(&admin, &id))
+        .await
+        .map_err(internal(
+            "the file is no longer served, but deleting it failed",
+        ))?;
+    if !deleted {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(empty())
+        .expect("valid response"))
+}
+
 // ---- client -----------------------------------------------------------------
 
 /// The page, served at / and at /d/<anything>: the link a recipient opens.
@@ -478,7 +582,8 @@ pub(crate) mod tests {
     //! the app and db tests.
 
     use std::fs;
-    use std::path::PathBuf;
+    use std::net::IpAddr;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, Once};
@@ -495,6 +600,8 @@ pub(crate) mod tests {
 
     use super::{Body, CONTENT_SECURITY_POLICY};
     use crate::app::{App, FileId, MAX_BLOB};
+    use crate::config::{Config, hex, token_sha256};
+    use crate::db::Error;
 
     // ---- helpers ------------------------------------------------------------
 
@@ -515,6 +622,53 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) const MEMBER_ID: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+    pub(crate) const MEMBER_TOKEN: &str = "member-token";
+    pub(crate) const ADMIN_ID: &str = "AQEBAQEBAQEBAQEBAQEBAQ";
+    pub(crate) const ADMIN_TOKEN: &str = "admin-token";
+    /// More than any test stores or sends.
+    pub(crate) const LOTS: u64 = 1 << 40;
+    pub(crate) const NO_LIMIT: [u64; 3] = [LOTS, LOTS, LOTS];
+
+    /// A member entry: `quota` is max_active_bytes, max_active_files,
+    /// max_bytes_per_week.
+    pub(crate) fn member(id: &str, name: &str, token: &str, quota: [u64; 3]) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name, "token_sha256": hex(&token_sha256(token)),
+            "max_active_bytes": quota[0], "max_active_files": quota[1], "max_bytes_per_week": quota[2],
+        })
+    }
+
+    /// A config of `members` and the one admin, with no trusted proxies and
+    /// rates no test reaches, as `edit` leaves it. Through the parser, as the
+    /// binary reads one.
+    pub(crate) fn config(
+        members: Vec<serde_json::Value>,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Config {
+        let mut c = serde_json::json!({
+            "members": members,
+            "admins": [{ "id": ADMIN_ID, "name": "the admin", "token_sha256": hex(&token_sha256(ADMIN_TOKEN)) }],
+            "trusted_proxies": [],
+            "upload_rate": { "requests": u32::MAX, "seconds": 1 },
+            "read_rate": { "requests": u32::MAX, "seconds": 1 },
+        });
+        edit(&mut c);
+        Config::parse(c.to_string().as_bytes()).unwrap()
+    }
+
+    /// One member with no practical limits, and the admin.
+    pub(crate) fn test_config() -> Config {
+        config(
+            vec![member(MEMBER_ID, "member", MEMBER_TOKEN, NO_LIMIT)],
+            |_| {},
+        )
+    }
+
+    pub(crate) fn open(dir: &Path) -> Result<App, Error> {
+        App::open(dir, test_config())
+    }
+
     pub(crate) struct Server {
         pub(crate) app: Arc<App>,
         pub(crate) dir: TempDir,
@@ -525,8 +679,24 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn server_with(setup: impl FnOnce(&mut App)) -> Server {
+        server_config(test_config(), setup)
+    }
+
+    pub(crate) fn server_config(config: Config, setup: impl FnOnce(&mut App)) -> Server {
         let dir = TempDir::new();
-        let mut app = App::open(&dir.0).unwrap();
+        let mut app = App::open(&dir.0, config).unwrap();
+        setup(&mut app);
+        Server {
+            app: Arc::new(app),
+            dir,
+        }
+    }
+
+    /// The same data directory, opened again under `config`: a restart.
+    pub(crate) fn restart(s: Server, config: Config, setup: impl FnOnce(&mut App)) -> Server {
+        let Server { app, dir } = s;
+        drop(app);
+        let mut app = App::open(&dir.0, config).unwrap();
         setup(&mut app);
         Server {
             app: Arc::new(app),
@@ -608,8 +778,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Where requests come from unless a test says otherwise.
+    pub(crate) const PEER: &str = "127.0.0.1";
+
     pub(crate) async fn send(
         s: &Server,
+        method: &str,
+        path: &str,
+        body: Source,
+        token: &str,
+    ) -> Reply {
+        send_from(s, PEER, &[], method, path, body, token).await
+    }
+
+    /// `send`, over a connection from `peer`, with X-Forwarded-For `forwarded`.
+    pub(crate) async fn send_from(
+        s: &Server,
+        peer: &str,
+        forwarded: &[&str],
         method: &str,
         path: &str,
         body: Source,
@@ -619,7 +805,11 @@ pub(crate) mod tests {
         if !token.is_empty() {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
-        let res = super::handle(s.app.clone(), req.body(body).unwrap()).await;
+        for line in forwarded {
+            req = req.header("X-Forwarded-For", *line);
+        }
+        let peer: IpAddr = peer.parse().unwrap();
+        let res = super::handle(s.app.clone(), peer, req.body(body).unwrap()).await;
         let (parts, body) = res.into_parts();
         Reply {
             status: parts.status,
@@ -655,7 +845,7 @@ pub(crate) mod tests {
 
     /// An upload to `path`, which carries its limits.
     pub(crate) async fn upload_with(s: &Server, path: &str, blob: &[u8]) -> Uploaded {
-        let r = send(s, "POST", path, Source::bytes(blob), "").await;
+        let r = send(s, "POST", path, Source::bytes(blob), MEMBER_TOKEN).await;
         assert_eq!(
             r.status,
             StatusCode::CREATED,
@@ -830,7 +1020,7 @@ pub(crate) mod tests {
             "POST",
             &live_path(),
             Source::zeros(Some(MAX_BLOB), None),
-            "",
+            MEMBER_TOKEN,
         )
         .await;
         assert_eq!(r.status, StatusCode::CREATED, "max_blob bytes");
@@ -839,7 +1029,9 @@ pub(crate) mod tests {
         let body = Source::zeros(None, None);
         let read = body.counter();
         assert_eq!(
-            send(&s, "POST", &live_path(), body, "").await.status,
+            send(&s, "POST", &live_path(), body, MEMBER_TOKEN)
+                .await
+                .status,
             StatusCode::PAYLOAD_TOO_LARGE,
             "endless body"
         );
@@ -855,7 +1047,7 @@ pub(crate) mod tests {
             "POST",
             &live_path(),
             Source::zeros(Some(MAX_BLOB + 1), None),
-            "",
+            MEMBER_TOKEN,
         )
         .await;
         assert_eq!(
@@ -868,7 +1060,9 @@ pub(crate) mod tests {
         let body = Source::zeros(None, Some(MAX_BLOB + 1));
         let read = body.counter();
         assert_eq!(
-            send(&s, "POST", &live_path(), body, "").await.status,
+            send(&s, "POST", &live_path(), body, MEMBER_TOKEN)
+                .await
+                .status,
             StatusCode::PAYLOAD_TOO_LARGE,
             "declared max_blob + 1"
         );
@@ -893,7 +1087,9 @@ pub(crate) mod tests {
             ..Source::zeros(Some(200_000), Some(1_000_000))
         };
         assert_eq!(
-            send(&s, "POST", &live_path(), body, "").await.status,
+            send(&s, "POST", &live_path(), body, MEMBER_TOKEN)
+                .await
+                .status,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
@@ -1134,7 +1330,7 @@ pub(crate) mod tests {
             ),
         ];
         for (why, path, expires_at, limit) in &accepted {
-            let r = send(&s, "POST", path, Source::bytes(b"blob"), "").await;
+            let r = send(&s, "POST", path, Source::bytes(b"blob"), MEMBER_TOKEN).await;
             assert_eq!(
                 r.status,
                 StatusCode::CREATED,
@@ -1245,7 +1441,7 @@ pub(crate) mod tests {
         for (why, path, message) in &refused {
             let body = Source::bytes(b"blob");
             let read = body.counter();
-            let r = send(&s, "POST", path, body, "").await;
+            let r = send(&s, "POST", path, body, MEMBER_TOKEN).await;
             assert_eq!(r.status, StatusCode::BAD_REQUEST, "{why}");
             let error = r.json()["error"].as_str().unwrap().to_owned();
             assert!(
@@ -1278,7 +1474,7 @@ pub(crate) mod tests {
         let req = Request::get(format!("/api/download/{id}"))
             .body(Source::bytes(b""))
             .unwrap();
-        let res = super::handle(s.app.clone(), req).await;
+        let res = super::handle(s.app.clone(), PEER.parse().unwrap(), req).await;
         assert_eq!(res.status(), StatusCode::OK, "start download");
         res.into_body()
     }
@@ -1520,5 +1716,745 @@ pub(crate) mod tests {
             "the expired file was deleted without a sweep"
         );
         drop(in_flight);
+    }
+
+    // ---- auth ---------------------------------------------------------------
+
+    const OTHER_ID: &str = "AgICAgICAgICAgICAgICAg";
+    const OTHER_TOKEN: &str = "other-token";
+
+    fn uploader_of(s: &Server, id: &str) -> Option<String> {
+        s.app
+            .db()
+            .conn()
+            .query_row("SELECT uploader_id FROM blobs WHERE id = ?", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn ledger(s: &Server) -> i64 {
+        s.app
+            .db()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM uploads", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// No token, a wrong one, the hash of a real one, and an admin's: all 401,
+    /// before a byte of the body is read, with nothing stored. And a member
+    /// removed from the config: their token stops working at the restart, and
+    /// their files stay recorded as theirs, by id.
+    #[tokio::test]
+    async fn upload_requires_a_members_token() {
+        let s = server();
+        let hash = hex(&token_sha256(MEMBER_TOKEN));
+        let refused = [
+            ("no token", ""),
+            ("a wrong token", "not-a-member-token"),
+            ("the token's hash", hash.as_str()),
+            ("an admin token", ADMIN_TOKEN),
+            ("the token with a character dropped", &MEMBER_TOKEN[1..]),
+        ];
+        for (why, token) in refused {
+            let body = Source::bytes(b"blob");
+            let read = body.counter();
+            let r = send(&s, "POST", &live_path(), body, token).await;
+            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{why}");
+            assert_eq!(read.load(Ordering::Relaxed), 0, "{why}: bytes read");
+        }
+        assert_eq!(
+            (
+                rows(&s),
+                ledger(&s),
+                entries(&s, "blobs"),
+                entries(&s, "tmp")
+            ),
+            (0, 0, 0, 0),
+            "rows, ledger, blobs, tmp after refused uploads"
+        );
+
+        let blob = random_blob(100);
+        let u = upload(&s, &blob).await;
+        assert_eq!(uploader_of(&s, &u.id).as_deref(), Some(MEMBER_ID));
+        let s = restart(
+            s,
+            config(
+                vec![member(OTHER_ID, "member", OTHER_TOKEN, NO_LIMIT)],
+                |_| {},
+            ),
+            |_| {},
+        );
+        let r = send(&s, "POST", &live_path(), Source::bytes(b"x"), MEMBER_TOKEN).await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNAUTHORIZED,
+            "a removed member's token"
+        );
+        let r = get(&s, &format!("/api/download/{}", u.id)).await;
+        assert!(
+            r.status == StatusCode::OK && r.body == blob,
+            "a removed member's file"
+        );
+        assert_eq!(uploader_of(&s, &u.id).as_deref(), Some(MEMBER_ID));
+    }
+
+    /// A rename changes the display name and nothing else: rows hold the id,
+    /// so the member's files, and the quota they use, are still theirs.
+    #[tokio::test]
+    async fn renamed_member_keeps_their_quota() {
+        let two_files = [LOTS, 2, LOTS];
+        let s = server_config(
+            config(
+                vec![member(MEMBER_ID, "Alice", MEMBER_TOKEN, two_files)],
+                |_| {},
+            ),
+            |_| {},
+        );
+        let a = upload(&s, &random_blob(10)).await;
+        let b = upload(&s, &random_blob(10)).await;
+        let s = restart(
+            s,
+            config(
+                vec![member(MEMBER_ID, "Alice Smith", MEMBER_TOKEN, two_files)],
+                |_| {},
+            ),
+            |_| {},
+        );
+        let r = send(&s, "POST", &live_path(), Source::bytes(b"x"), MEMBER_TOKEN).await;
+        assert_eq!(
+            r.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a third file after the rename"
+        );
+        let error = r.json()["error"].as_str().unwrap().to_owned();
+        assert!(
+            error.starts_with("You have 2 files stored, and your limit is 2 at once."),
+            "{error}"
+        );
+        for u in [&a, &b] {
+            assert_eq!(uploader_of(&s, &u.id).as_deref(), Some(MEMBER_ID));
+        }
+    }
+
+    /// A new member given a departed member's name is a new id. They inherit
+    /// none of the quota used, and a takedown of the departed member's file
+    /// names the departed member's id, not theirs.
+    #[tokio::test]
+    async fn reused_name_inherits_nothing() {
+        capture_logs();
+        let quota = [1000, LOTS, LOTS];
+        let s = server_config(
+            config(vec![member(MEMBER_ID, "Sam", MEMBER_TOKEN, quota)], |_| {}),
+            |_| {},
+        );
+        let departed = upload(&s, &random_blob(1000)).await;
+        let s = restart(
+            s,
+            config(vec![member(OTHER_ID, "Sam", OTHER_TOKEN, quota)], |_| {}),
+            |_| {},
+        );
+        let r = send(
+            &s,
+            "POST",
+            &live_path(),
+            Source::bytes(&random_blob(1000)),
+            OTHER_TOKEN,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::CREATED,
+            "the new Sam's first 1000 bytes"
+        );
+        let new = r.json()["id"].as_str().unwrap().to_owned();
+        let r = send(&s, "POST", &live_path(), Source::bytes(b"x"), OTHER_TOKEN).await;
+        assert_eq!(
+            r.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the new Sam's own usage counts"
+        );
+
+        for (file, uploader, not) in [
+            (&departed.id, MEMBER_ID, OTHER_ID),
+            (&new, OTHER_ID, MEMBER_ID),
+        ] {
+            let r = send(
+                &s,
+                "DELETE",
+                &format!("/api/admin/{file}"),
+                Source::bytes(b""),
+                ADMIN_TOKEN,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::NO_CONTENT, "admin delete");
+            let said = logged(file);
+            assert_eq!(said.len(), 1, "log lines naming {file}: {said:?}");
+            let (level, line) = &said[0];
+            assert!(
+                *level == log::Level::Warn
+                    && line.starts_with("ADMIN DELETE:")
+                    && line.contains(ADMIN_ID)
+                    && line.contains(&format!("uploaded by member {uploader}"))
+                    && !line.contains(not),
+                "{line}"
+            );
+        }
+        let (_, line) = &logged(&departed.id)[0];
+        assert!(line.contains("no longer in the config"), "{line}");
+    }
+
+    /// Only an admin token deletes by id. It reaches a file that has expired
+    /// but not been swept, which the owner cannot; the deletion is verified,
+    /// blob then row; and the log names the admin, the file and the uploader.
+    #[tokio::test]
+    async fn admin_delete() {
+        const T0: i64 = 1_800_000_000;
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        capture_logs();
+        let s = server_with(|app| app.now = || CLOCK.load(Ordering::Relaxed));
+        let u = upload_with(&s, &limits_path(T0 + 60, 0), &random_blob(1000)).await;
+        let other = upload_with(&s, &limits_path(T0 + 3600, 0), &random_blob(1000)).await;
+        let path = format!("/api/admin/{}", u.id);
+        for (why, token) in [
+            ("no token", ""),
+            ("a member's token", MEMBER_TOKEN),
+            ("the file's owner token", u.owner_token.as_str()),
+            ("a wrong token", "not-the-admin-token"),
+        ] {
+            let r = send(&s, "DELETE", &path, Source::bytes(b""), token).await;
+            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{why}");
+        }
+        assert!(
+            blob_exists(&s, &u.id),
+            "a refused admin delete removed the file"
+        );
+        assert!(
+            logged(&u.id).is_empty(),
+            "a refused admin delete was logged as one"
+        );
+
+        CLOCK.store(T0 + 60, Ordering::Relaxed);
+        let r = send(
+            &s,
+            "DELETE",
+            &format!("/api/{}", u.id),
+            Source::bytes(b""),
+            &u.owner_token,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::NOT_FOUND,
+            "the owner, once it has expired"
+        );
+        for id in [FileId::random().to_string(), "not-an-id".into()] {
+            let r = send(
+                &s,
+                "DELETE",
+                &format!("/api/admin/{id}"),
+                Source::bytes(b""),
+                ADMIN_TOKEN,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::NOT_FOUND, "admin delete of {id}");
+        }
+        let r = send(&s, "DELETE", &path, Source::bytes(b""), ADMIN_TOKEN).await;
+        assert_eq!(
+            r.status,
+            StatusCode::NO_CONTENT,
+            "admin delete of an expired, unswept file"
+        );
+        assert!(
+            !blob_exists(&s, &u.id) && counts(&s, &u.id).is_none(),
+            "blob or row left after the admin delete"
+        );
+        let said = logged(&u.id);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(
+            said[0].1,
+            format!(
+                "ADMIN DELETE: admin {ADMIN_ID} (the admin) deleted file {}, uploaded by member {MEMBER_ID} (member)",
+                u.id
+            )
+        );
+        let r = send(&s, "DELETE", &path, Source::bytes(b""), ADMIN_TOKEN).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "a second admin delete");
+        assert_eq!(
+            get(&s, &format!("/api/meta/{}", other.id)).await.status,
+            StatusCode::OK,
+            "another file went too"
+        );
+    }
+
+    // ---- quotas -------------------------------------------------------------
+
+    const T0: i64 = 1_800_000_000;
+
+    fn error_of(r: &Reply) -> String {
+        r.json()["error"].as_str().unwrap().to_owned()
+    }
+
+    /// Stored bytes are freed when a file expires, not when the sweep after it
+    /// runs, and when a file is deleted.
+    #[tokio::test]
+    async fn active_bytes_freed_by_expiry_and_deletion() {
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        let s = server_config(
+            config(
+                vec![member(MEMBER_ID, "m", MEMBER_TOKEN, [1000, LOTS, LOTS])],
+                |_| {},
+            ),
+            |app| app.now = || CLOCK.load(Ordering::Relaxed),
+        );
+        let first = upload_with(&s, &limits_path(T0 + 600, 0), &random_blob(800)).await;
+        let path = limits_path(T0 + 3600, 0);
+        let r = send(
+            &s,
+            "POST",
+            &path,
+            Source::bytes(&random_blob(800)),
+            MEMBER_TOKEN,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error_of(&r),
+            "Your files take 800 of your 1000 bytes stored at once. \
+             Enough frees in 10 minutes as your files expire, or sooner if you delete some."
+        );
+
+        CLOCK.store(T0 + 600, Ordering::Relaxed);
+        assert!(
+            counts(&s, &first.id).is_some(),
+            "swept: this test is about expiry alone"
+        );
+        let second = upload_with(&s, &path, &random_blob(800)).await;
+
+        let r = send(
+            &s,
+            "POST",
+            &path,
+            Source::bytes(&random_blob(800)),
+            MEMBER_TOKEN,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "full again");
+        let r = send(
+            &s,
+            "DELETE",
+            &format!("/api/{}", second.id),
+            Source::bytes(b""),
+            &second.owner_token,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        upload_with(&s, &path, &random_blob(800)).await;
+    }
+
+    /// The weekly allowance is counted from the upload ledger, which deleting
+    /// a file does not touch: upload, delete, upload again is refused. It
+    /// frees only as each upload leaves the 7 days.
+    #[tokio::test]
+    async fn weekly_bytes_not_freed_by_deletion() {
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        let s = server_config(
+            config(
+                vec![member(MEMBER_ID, "m", MEMBER_TOKEN, [LOTS, LOTS, 1000])],
+                |_| {},
+            ),
+            |app| app.now = || CLOCK.load(Ordering::Relaxed),
+        );
+        let path = || limits_path(CLOCK.load(Ordering::Relaxed) + 3600, 0);
+        let u = upload_with(&s, &path(), &random_blob(800)).await;
+        let r = send(
+            &s,
+            "DELETE",
+            &format!("/api/{}", u.id),
+            Source::bytes(b""),
+            &u.owner_token,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            (rows(&s), ledger(&s)),
+            (0, 1),
+            "rows, ledger after the delete"
+        );
+
+        let want = "You have uploaded 800 of your 1000 bytes allowed per 7 days. \
+                    Enough frees in 7 days as your earlier uploads pass 7 days old. \
+                    Deleting files does not give any back.";
+        let r = send(
+            &s,
+            "POST",
+            &path(),
+            Source::bytes(&random_blob(800)),
+            MEMBER_TOKEN,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "after the delete");
+        assert_eq!(error_of(&r), want);
+        CLOCK.store(T0 + WEEK - 1, Ordering::Relaxed);
+        let r = send(
+            &s,
+            "POST",
+            &path(),
+            Source::bytes(&random_blob(800)),
+            MEMBER_TOKEN,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a second short of 7 days"
+        );
+        assert!(
+            error_of(&r).contains("Enough frees in 1 second"),
+            "{}",
+            error_of(&r)
+        );
+        CLOCK.store(T0 + WEEK, Ordering::Relaxed);
+        upload_with(&s, &path(), &random_blob(800)).await;
+
+        let r = send(
+            &s,
+            "POST",
+            &path(),
+            Source::bytes(&random_blob(1001)),
+            MEMBER_TOKEN,
+        )
+        .await;
+        assert_eq!(
+            error_of(&r),
+            "This upload is larger than your limit of 1000 bytes uploaded per 7 days."
+        );
+    }
+
+    const WEEK: i64 = crate::config::WEEK;
+
+    /// Refused as soon as it can be: a declared length over the member's room
+    /// before a byte is read, and a body with no length once it passes the
+    /// room, not max_blob. Each limit's own room caps the stream. Nothing is
+    /// stored.
+    #[tokio::test]
+    async fn stream_cut_off_at_the_quota() {
+        let s = server_config(
+            config(
+                vec![
+                    member(MEMBER_ID, "m", MEMBER_TOKEN, [100_000, LOTS, LOTS]),
+                    member(OTHER_ID, "o", OTHER_TOKEN, [LOTS, LOTS, 50_000]),
+                ],
+                |_| {},
+            ),
+            |_| {},
+        );
+        let s = &s;
+        let endless = |token| async move {
+            let body = Source::zeros(None, None);
+            let read = body.counter();
+            let r = send(s, "POST", &live_path(), body, token).await;
+            (r, read.load(Ordering::Relaxed))
+        };
+
+        let (r, read) = endless(MEMBER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error_of(&r),
+            "This upload is larger than your limit of 100000 bytes stored at once."
+        );
+        assert!(
+            read <= 100_000 + 64 * 1024,
+            "read {read} bytes of a body over the quota"
+        );
+
+        upload(s, &random_blob(60_000)).await;
+        let (r, read) = endless(MEMBER_TOKEN).await;
+        assert!(
+            error_of(&r).starts_with("Your files take 60000 of your 100000 bytes"),
+            "{}",
+            error_of(&r)
+        );
+        assert!(
+            read <= 40_000 + 64 * 1024,
+            "read {read} bytes with 40000 of room"
+        );
+
+        let (r, read) = endless(OTHER_TOKEN).await;
+        assert_eq!(
+            error_of(&r),
+            "This upload is larger than your limit of 50000 bytes uploaded per 7 days."
+        );
+        assert!(
+            read <= 50_000 + 64 * 1024,
+            "read {read} bytes with 50000 of weekly room"
+        );
+
+        let body = Source::zeros(None, Some(40_001));
+        let read = body.counter();
+        let r = send(s, "POST", &live_path(), body, MEMBER_TOKEN).await;
+        assert_eq!(
+            r.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "declared one byte over the room"
+        );
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            0,
+            "bytes read of a body declared over the quota"
+        );
+
+        assert_eq!(
+            (rows(s), ledger(s), entries(s, "blobs"), entries(s, "tmp")),
+            (1, 1, 1, 0),
+            "rows, ledger, blobs, tmp"
+        );
+    }
+
+    /// Sixteen uploads race for the last of a member's room, round after
+    /// round. They all pass the checks before and during the body, since none
+    /// is saved yet; the check in the saving transaction lets exactly one land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn parallel_uploads_race_for_the_last_room() {
+        const ROUNDS: usize = 20;
+        const RACERS: usize = 16;
+        for round in 0..ROUNDS {
+            let s = Arc::new(server_config(
+                config(
+                    vec![member(MEMBER_ID, "m", MEMBER_TOKEN, [1000, LOTS, LOTS])],
+                    |_| {},
+                ),
+                |_| {},
+            ));
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let s = s.clone();
+                    tokio::spawn(async move {
+                        send(
+                            &s,
+                            "POST",
+                            &live_path(),
+                            Source::bytes(&random_blob(600)),
+                            MEMBER_TOKEN,
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            let mut landed = 0;
+            for racer in racers {
+                let r = racer.await.unwrap();
+                match r.status {
+                    StatusCode::CREATED => landed += 1,
+                    StatusCode::PAYLOAD_TOO_LARGE => assert!(
+                        error_of(&r).starts_with("Your files take 600 of your 1000 bytes"),
+                        "round {round}: {}",
+                        error_of(&r)
+                    ),
+                    other => panic!("round {round}: {other}"),
+                }
+            }
+            assert_eq!(landed, 1, "round {round}: uploads landed with room for one");
+            assert_eq!(
+                (
+                    rows(&s),
+                    ledger(&s),
+                    entries(&s, "blobs"),
+                    entries(&s, "tmp")
+                ),
+                (1, 1, 1, 0),
+                "round {round}: rows, ledger, blobs, tmp"
+            );
+        }
+    }
+
+    // ---- rate limits --------------------------------------------------------
+
+    /// Uploads are limited per member: over the rate, 429 with Retry-After,
+    /// before the body is read, and another member is unaffected.
+    #[tokio::test]
+    async fn upload_rate_per_member() {
+        let s = server_config(
+            config(
+                vec![
+                    member(MEMBER_ID, "m", MEMBER_TOKEN, NO_LIMIT),
+                    member(OTHER_ID, "o", OTHER_TOKEN, NO_LIMIT),
+                ],
+                |c| c["upload_rate"] = serde_json::json!({ "requests": 2, "seconds": 3600 }),
+            ),
+            |_| {},
+        );
+        upload(&s, b"a").await;
+        upload(&s, b"b").await;
+        let body = Source::bytes(b"c");
+        let read = body.counter();
+        let r = send(&s, "POST", &live_path(), body, MEMBER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(r.headers["retry-after"], "1800");
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            0,
+            "bytes read of a rate-limited upload"
+        );
+        let r = send(&s, "POST", &live_path(), Source::bytes(b"d"), OTHER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::CREATED, "another member");
+        assert_eq!(rows(&s), 3);
+    }
+
+    /// The read limit says nothing about which IDs exist. It runs before the
+    /// ID is parsed and counts every request, so a real, a missing and a
+    /// malformed ID are each refused at the same request, and the refusals
+    /// are the same bytes: status, headers and body.
+    #[tokio::test]
+    async fn read_limit_does_not_leak_existence() {
+        let s = server_config(
+            config(vec![member(MEMBER_ID, "m", MEMBER_TOKEN, NO_LIMIT)], |c| {
+                c["read_rate"] = serde_json::json!({ "requests": 3, "seconds": 3600 })
+            }),
+            |_| {},
+        );
+        let u = upload(&s, &random_blob(100)).await;
+        let ids = [
+            u.id.clone(),
+            FileId::random().to_string(),
+            "..%2Fnot-an-id".to_owned(),
+        ];
+        let mut refusals = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let peer = format!("192.0.2.{}", i + 1);
+            let requests = [
+                ("GET", format!("/api/meta/{id}")),
+                ("HEAD", format!("/api/meta/{id}")),
+                ("GET", format!("/api/download/{id}")),
+            ];
+            for (method, path) in &requests {
+                let r = send_from(&s, &peer, &[], method, path, Source::bytes(b""), "").await;
+                assert!(
+                    r.status != StatusCode::TOO_MANY_REQUESTS,
+                    "{method} {path}: refused early"
+                );
+            }
+            for (method, path) in &requests {
+                let r = send_from(&s, &peer, &[], method, path, Source::bytes(b""), "").await;
+                assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{method} {path}");
+                refusals.push((format!("{:?}", r.headers), r.body));
+            }
+        }
+        for r in &refusals[1..] {
+            assert!(*r == refusals[0], "{r:?}\nis not\n{:?}", refusals[0]);
+        }
+        assert!(
+            refusals[0].0.contains(r#""retry-after": "1200""#),
+            "{}",
+            refusals[0].0
+        );
+        assert_eq!(
+            counts(&s, &u.id),
+            Some((1, 0, 0)),
+            "downloads of the real file"
+        );
+    }
+
+    /// Behind a trusted proxy the read limit is per client, not per proxy, and
+    /// a forged X-Forwarded-For cannot move a client out of its bucket. Two
+    /// addresses in one IPv6 /64 are one client. With no trusted proxies the
+    /// header changes nothing.
+    #[tokio::test]
+    async fn read_limit_keyed_by_the_client_address() {
+        let one = serde_json::json!({ "requests": 1, "seconds": 3600 });
+        let proxied = server_config(
+            config(vec![], |c| {
+                c["read_rate"] = one.clone();
+                c["trusted_proxies"] = serde_json::json!(["10.0.0.1"]);
+            }),
+            |_| {},
+        );
+        let path = format!("/api/meta/{}", FileId::random());
+        const OK: StatusCode = StatusCode::NOT_FOUND; // allowed through, to an ID never issued
+        const NO: StatusCode = StatusCode::TOO_MANY_REQUESTS;
+        let s = &proxied;
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["198.51.100.1"]).await,
+            OK,
+            "client 1 via the proxy"
+        );
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["198.51.100.1"]).await,
+            NO,
+            "client 1 again"
+        );
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["198.51.100.2"]).await,
+            OK,
+            "client 2, same proxy"
+        );
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["1.2.3.4, 198.51.100.1"]).await,
+            NO,
+            "client 1 forging an entry"
+        );
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["10.0.0.1", "198.51.100.1"]).await,
+            NO,
+            "client 1 naming the proxy"
+        );
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["2001:db8:1:2::1"]).await,
+            OK,
+            "an IPv6 client"
+        );
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["2001:db8:1:2:ffff::9"]).await,
+            NO,
+            "the same /64"
+        );
+        assert_eq!(
+            read_status(s, &path, "10.0.0.1", &["2001:db8:1:3::1"]).await,
+            OK,
+            "the next /64"
+        );
+        assert_eq!(
+            read_status(s, &path, "203.0.113.5", &["198.51.100.3"]).await,
+            OK,
+            "not through the proxy"
+        );
+        assert_eq!(
+            read_status(s, &path, "203.0.113.5", &["198.51.100.4"]).await,
+            NO,
+            "its header is not believed"
+        );
+
+        let direct = direct_server();
+        let s = &direct;
+        assert_eq!(
+            read_status(s, &path, "203.0.113.5", &["198.51.100.1"]).await,
+            OK,
+            "no trusted proxies"
+        );
+        assert_eq!(
+            read_status(s, &path, "203.0.113.5", &["198.51.100.2"]).await,
+            NO,
+            "a spoofed header, ignored"
+        );
+        assert_eq!(
+            read_status(s, &path, "203.0.113.6", &[]).await,
+            OK,
+            "another address"
+        );
+    }
+
+    async fn read_status(s: &Server, path: &str, peer: &str, forwarded: &[&str]) -> StatusCode {
+        send_from(s, peer, forwarded, "GET", path, Source::bytes(b""), "")
+            .await
+            .status
+    }
+
+    fn direct_server() -> Server {
+        server_config(
+            config(vec![], |c| {
+                c["read_rate"] = serde_json::json!({ "requests": 1, "seconds": 3600 })
+            }),
+            |_| {},
+        )
     }
 }

@@ -2,10 +2,14 @@
 //! no cryptography; the browser client, built in, does all of it.
 //!
 //!     sunbird [-addr 127.0.0.1:8080] [-data data] [-config sunbird.json]
+//!     sunbird mint-token
+//!     sunbird mint-id
 
 mod app;
+mod config;
 mod db;
 mod http;
+mod limit;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -19,16 +23,21 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 
 use crate::app::App;
+use crate::config::Config;
 
 /// How often the sweeper runs. A file past its limits is refused from the
 /// moment it is (the check is on every read); this bounds only how long its
 /// bytes stay on disk after that.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
+const USAGE: &str = "usage: sunbird [-addr 127.0.0.1:8080] [-data data] [-config sunbird.json]
+       sunbird mint-token   a new upload or admin token, and the hash for the config
+       sunbird mint-id      a new member or admin id, for the config";
+
 struct Flags {
     addr: String,
     data: PathBuf,
-    config: Option<PathBuf>,
+    config: PathBuf,
 }
 
 impl Flags {
@@ -37,7 +46,7 @@ impl Flags {
         let mut flags = Flags {
             addr: "127.0.0.1:8080".into(),
             data: "data".into(),
-            config: None,
+            config: "sunbird.json".into(),
         };
         while let Some(arg) = args.next() {
             let name = arg
@@ -54,7 +63,7 @@ impl Flags {
             match name {
                 "addr" => flags.addr = value,
                 "data" => flags.data = value.into(),
-                "config" => flags.config = Some(value.into()),
+                "config" => flags.config = value.into(),
                 _ => return Err(format!("unknown flag -{name}")),
             }
         }
@@ -65,17 +74,53 @@ impl Flags {
 #[tokio::main]
 async fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let flags = match Flags::parse(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        // The token is printed once, here, and kept nowhere: the config gets
+        // only its hash. Separate from mint-id, so that reissuing a lost or
+        // leaked token cannot change whose files are whose.
+        ["mint-token"] => {
+            let token = config::mint_token();
+            println!("token:        {token}");
+            println!(
+                "token_sha256: {}",
+                config::hex(&config::token_sha256(&token))
+            );
+            println!();
+            println!(
+                "Give the token to its holder; it is not stored anywhere and cannot be shown again."
+            );
+            println!("Put token_sha256 in the config, in their member or admin entry.");
+            return ExitCode::SUCCESS;
+        }
+        ["mint-id"] => {
+            println!("{}", config::MemberId::mint());
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+    let flags = match Flags::parse(args.into_iter()) {
         Ok(flags) => flags,
         Err(e) => {
-            eprintln!(
-                "{e}\nusage: sunbird [-addr 127.0.0.1:8080] [-data data] [-config sunbird.json]"
-            );
+            eprintln!("{e}\n{USAGE}");
             return ExitCode::from(2);
         }
     };
+    let config = match Config::read(&flags.config) {
+        Ok(config) => config,
+        Err(e) => {
+            log::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    log::info!(
+        "{} members, {} admins, trusted proxies: {:?}",
+        config.members.len(),
+        config.admins.len(),
+        config.trusted_proxies
+    );
     let data = flags.data.clone();
-    let app = match tokio::task::spawn_blocking(move || App::open(&data))
+    let app = match tokio::task::spawn_blocking(move || App::open(&data, config))
         .await
         .expect("open panicked")
     {
@@ -92,13 +137,6 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(config) = &flags.config {
-        log::warn!(
-            "{}: not read; members, quotas and rate limits arrive in session 03",
-            config.display()
-        );
-    }
-    log::warn!("uploads are not authenticated yet; do not expose this server");
     log::info!(
         "listening on {}, data in {}",
         flags.addr,
@@ -115,6 +153,8 @@ async fn main() -> ExitCode {
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 every.tick().await;
+                app.upload_limit.forget_idle();
+                app.read_limit.forget_idle();
                 let app = app.clone();
                 match tokio::task::spawn_blocking(move || app.sweep()).await {
                     Ok(Ok((0, 0))) => {}
@@ -129,8 +169,8 @@ async fn main() -> ExitCode {
     });
 
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
             Err(e) => {
                 // Out of file descriptors, most likely. Wait, don't spin or die.
                 log::error!("accept: {e}");
@@ -142,7 +182,7 @@ async fn main() -> ExitCode {
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let app = app.clone();
-                async move { Ok::<_, Infallible>(http::handle(app, req).await) }
+                async move { Ok::<_, Infallible>(http::handle(app, peer.ip(), req).await) }
             });
             // No overall read timeout: a 100 MB upload on a slow link is
             // legitimate. The headers get 10 seconds.

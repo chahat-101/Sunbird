@@ -4,6 +4,7 @@
 
 use std::fs::{self, DirBuilder};
 use std::io::ErrorKind;
+use std::net::IpAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -14,7 +15,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::db::{Db, Error};
+use crate::config::{Admin, Config, Member, MemberId};
+use crate::db::{Db, Error, Usage};
+use crate::limit::Limiter;
 
 /// max_blob from protocol.md §6.4: 8,192 + 1601 × 65,536. The only format
 /// limit the server knows, and a plain byte count.
@@ -191,6 +194,11 @@ pub struct App {
     db: Mutex<Db>,
     /// The clock limits are judged by, in Unix seconds. Tests replace it.
     pub now: fn() -> i64,
+    pub config: Config,
+    /// Uploads, per member id.
+    pub upload_limit: Limiter<MemberId>,
+    /// Previews and downloads, per client address (an IPv6 /64).
+    pub read_limit: Limiter<IpAddr>,
 }
 
 fn system_clock() -> i64 {
@@ -206,7 +214,7 @@ impl App {
     /// download claims still in flight, and blobs with no row.
     ///
     /// It does not sweep: `sweep` judges by `now`, which a test sets after this.
-    pub fn open(dir: &Path) -> Result<App, Error> {
+    pub fn open(dir: &Path, config: Config) -> Result<App, Error> {
         for sub in ["blobs", "tmp"] {
             DirBuilder::new()
                 .recursive(true)
@@ -228,6 +236,9 @@ impl App {
             dir: dir.to_owned(),
             db: Mutex::new(db),
             now: system_clock,
+            upload_limit: Limiter::new(config.upload_rate),
+            read_limit: Limiter::new(config.read_rate),
+            config,
         };
         app.remove_orphans()?;
         Ok(app)
@@ -251,8 +262,14 @@ impl App {
             .join(format!("upload-{:016x}", u64::from_ne_bytes(b)))
     }
 
-    /// Gives a completed upload its ID. The hard link fails if the name is
-    /// taken, so an ID collision never overwrites a blob; a rename would.
+    /// What a member has stored, and has uploaded in the last 7 days.
+    pub fn usage(&self, member: &MemberId) -> Result<Usage, Error> {
+        Ok(self.db().usage(member, (self.now)())?)
+    }
+
+    /// Gives a completed upload its ID, recorded as `uploader`'s, if their
+    /// quota has room: Ok(Err) is the refusal. The hard link fails if the name
+    /// is taken, so an ID collision never overwrites a blob; a rename would.
     /// The file comes before the row: a crash in between leaves a file nothing
     /// refers to, which the next `open` removes, never a row with no file.
     pub fn commit(
@@ -261,13 +278,15 @@ impl App {
         owner: &OwnerTokenHash,
         size: u64,
         limits: Limits,
-    ) -> Result<FileId, Error> {
+        uploader: &Member,
+    ) -> Result<Result<FileId, String>, Error> {
         self.commit_as(
             std::iter::repeat_with(FileId::random).take(3),
             tmp,
             owner,
             size,
             limits,
+            uploader,
         )
     }
 
@@ -279,18 +298,21 @@ impl App {
         owner: &OwnerTokenHash,
         size: u64,
         limits: Limits,
-    ) -> Result<FileId, Error> {
+        uploader: &Member,
+    ) -> Result<Result<FileId, String>, Error> {
         let mut taken = None;
         for id in ids {
             match fs::hard_link(tmp, self.blob_path(&id)) {
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => taken = Some(e),
                 Err(e) => return Err(e.into()),
                 Ok(()) => {
-                    if let Err(e) = self.db().insert(&id, owner, size, (self.now)(), limits) {
+                    let inserted =
+                        self.db()
+                            .insert(&id, owner, size, (self.now)(), limits, uploader);
+                    if !matches!(inserted, Ok(Ok(()))) {
                         let _ = fs::remove_file(self.blob_path(&id));
-                        return Err(e);
                     }
-                    return Ok(id);
+                    return inserted.map(|stored| stored.map(|()| id));
                 }
             }
         }
@@ -331,6 +353,43 @@ impl App {
                     path.display()
                 );
                 Err(e.into())
+            }
+        }
+    }
+
+    /// An admin's deletion, for revoking a file or answering a takedown: any
+    /// file with a row, including one expired or used up but not yet swept.
+    /// False if there is no such file. It is marked and purged as the sweeper
+    /// does, so the deletion is verified, and it is logged naming the admin,
+    /// the file and the uploader, whether it succeeds or fails.
+    pub fn admin_delete(&self, admin: &Admin, id: &FileId) -> Result<bool, Error> {
+        // Bound first, as in `end_download`: `purge` locks the database again.
+        let uploader = {
+            let db = self.db();
+            let Some(uploader) = db.uploader(id)? else {
+                return Ok(false);
+            };
+            db.mark_deleting(id)?;
+            uploader
+        };
+        let uploader = match uploader {
+            None => "nobody: it was uploaded before uploads were authenticated".to_owned(),
+            Some(uid) => match self.config.member_by_id(&uid) {
+                Some(m) => format!("member {uid} ({})", m.name),
+                None => format!("member {uid} (no longer in the config)"),
+            },
+        };
+        let by = format!("admin {} ({})", admin.id, admin.name);
+        match self.purge(id) {
+            Ok(()) => {
+                log::warn!("ADMIN DELETE: {by} deleted file {id}, uploaded by {uploader}");
+                Ok(true)
+            }
+            Err(e) => {
+                log::error!(
+                    "ADMIN DELETE FAILED: {by} could not delete file {id}, uploaded by {uploader}: {e}"
+                );
+                Err(e)
             }
         }
     }
@@ -404,9 +463,9 @@ mod tests {
     #[test]
     fn open_clears_partial_uploads() {
         let dir = TempDir::new();
-        drop(App::open(&dir.0).unwrap());
+        drop(open(&dir.0).unwrap());
         fs::write(dir.0.join("tmp/upload-123"), "partial").unwrap();
-        drop(App::open(&dir.0).unwrap());
+        drop(open(&dir.0).unwrap());
         assert_eq!(
             fs::read_dir(dir.0.join("tmp")).unwrap().count(),
             0,
@@ -462,15 +521,26 @@ mod tests {
             },
         );
 
+        let uploader = &s.app.config.members[0];
         let three = std::iter::repeat_n(taken.clone(), 3);
         assert!(
-            s.app.commit_as(three, &tmp, &owner, 500, limits).is_err(),
+            s.app
+                .commit_as(three, &tmp, &owner, 500, limits, uploader)
+                .is_err(),
             "a taken ID was accepted"
         );
         let fresh = FileId::random();
         let got = s
             .app
-            .commit_as([taken.clone(), fresh.clone()], &tmp, &owner, 500, limits)
+            .commit_as(
+                [taken.clone(), fresh.clone()],
+                &tmp,
+                &owner,
+                500,
+                limits,
+                uploader,
+            )
+            .unwrap()
             .unwrap();
         assert_eq!(got, fresh, "the next ID was not tried");
         assert!(
@@ -516,7 +586,7 @@ mod tests {
         let Server { app, dir } = s;
         drop(app);
         let s = Server {
-            app: Arc::new(App::open(&dir.0).unwrap()),
+            app: Arc::new(open(&dir.0).unwrap()),
             dir,
         };
         assert!(!orphan.exists(), "a blob with no row survived open");

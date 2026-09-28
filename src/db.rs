@@ -9,6 +9,7 @@ use rusqlite::{
 };
 
 use crate::app::{FileId, Limits, OwnerTokenHash};
+use crate::config::{Member, MemberId, WEEK};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -144,6 +145,15 @@ impl Db {
         }
     }
 
+    /// Stores a file's row, and its entry in the upload ledger, if the
+    /// uploader's quota has room for it. Ok(Err) is a refusal, with the message
+    /// for the member; nothing was written.
+    ///
+    /// This is the last of the three quota checks, and the one that decides.
+    /// The first two, before and while the body is read, see usage without
+    /// holding anything, so parallel uploads all pass them. This one reads
+    /// usage and writes the row in one IMMEDIATE transaction, so uploads by the
+    /// same member queue here, and each sees the rows of those before it.
     pub fn insert(
         &mut self,
         id: &FileId,
@@ -151,17 +161,28 @@ impl Db {
         size: u64,
         now: i64,
         limits: Limits,
-    ) -> Result<(), Error> {
+        uploader: &Member,
+    ) -> Result<Result<(), String>, Error> {
         self.write(|tx| {
-            // uploader_id stays NULL: the record of a file uploaded before
-            // uploads were authenticated. Authentication is session 03.
+            if let Err(refusal) = uploader.quota.admit(&usage(tx, &uploader.id, now)?, size, now) {
+                return Ok(Err(refusal));
+            }
             tx.execute(
-                "INSERT INTO blobs (id, owner_token_hash, size, created_at, expires_at, max_downloads)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                params![id.to_string(), &owner.as_bytes()[..], size as i64, now, limits.expires_at, limits.max_downloads],
+                "INSERT INTO blobs (id, owner_token_hash, size, created_at, expires_at, max_downloads, uploader_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![id.to_string(), &owner.as_bytes()[..], size as i64, now, limits.expires_at, limits.max_downloads, uploader.id.as_str()],
             )?;
-            Ok(())
+            tx.execute(
+                "INSERT INTO uploads (uploader_id, size, created_at) VALUES (?, ?, ?)",
+                params![uploader.id.as_str(), size as i64, now],
+            )?;
+            Ok(Ok(()))
         })
+    }
+
+    /// What a member has stored, and has uploaded in the last 7 days.
+    pub fn usage(&self, member: &MemberId, now: i64) -> rusqlite::Result<Usage> {
+        usage(&self.0, member, now)
     }
 
     /// The size of a servable file.
@@ -294,6 +315,18 @@ impl Db {
             .map(drop)
     }
 
+    /// Whether a row, in any state, refers to `id`, and if so who uploaded it:
+    /// None for a file uploaded before uploads were authenticated.
+    pub fn uploader(&self, id: &FileId) -> rusqlite::Result<Option<Option<String>>> {
+        self.0
+            .query_row(
+                "SELECT uploader_id FROM blobs WHERE id = ?",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
     /// Whether any row, in any state, refers to `id`.
     pub fn has_row(&self, id: &FileId) -> rusqlite::Result<bool> {
         self.0.query_row(
@@ -307,6 +340,42 @@ impl Db {
     pub fn conn(&self) -> &Connection {
         &self.0
     }
+}
+
+/// A member's usage, as the quota counts it. Blob sizes, as stored.
+pub struct Usage {
+    /// (size, expires_at) of each file the member has that is not expired and
+    /// not marked for deletion, soonest to expire first. A used-up file whose
+    /// last download is still in flight counts: that transfer may be refunded.
+    pub files: Vec<(u64, i64)>,
+    /// (size, created_at) of each upload in the last 7 days, oldest first,
+    /// from the ledger. Deleting a file does not touch it.
+    pub week: Vec<(u64, i64)>,
+}
+
+fn usage(conn: &Connection, member: &MemberId, now: i64) -> rusqlite::Result<Usage> {
+    let pairs = |sql: &str, since: i64| -> rusqlite::Result<Vec<(u64, i64)>> {
+        conn.prepare(sql)?
+            .query_map(
+                named_params! { ":member": member.as_str(), ":since": since },
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+            )?
+            .collect()
+    };
+    Ok(Usage {
+        files: pairs(
+            "SELECT size, expires_at FROM blobs
+             WHERE uploader_id = :member AND deleting = 0 AND expires_at > :since
+             ORDER BY expires_at",
+            now,
+        )?,
+        week: pairs(
+            "SELECT size, created_at FROM uploads
+             WHERE uploader_id = :member AND created_at > :since
+             ORDER BY created_at",
+            now - WEEK,
+        )?,
+    })
 }
 
 /// Migration 4: each member name stored as an uploader_id becomes the id of the
@@ -423,7 +492,7 @@ mod tests {
         );
 
         let s = Server {
-            app: Arc::new(App::open(&dir.0).expect("a step 05 data directory did not open")),
+            app: Arc::new(open(&dir.0).expect("a step 05 data directory did not open")),
             dir,
         };
         assert_eq!(user_version(s.app.db().conn()), 5);
@@ -474,7 +543,7 @@ mod tests {
         // Opening again migrates nothing and loses nothing.
         let Server { app, dir } = s;
         drop(app);
-        let app = App::open(&dir.0).unwrap();
+        let app = open(&dir.0).unwrap();
         let db = app.db();
         let rows: i64 = db
             .conn()
@@ -501,7 +570,7 @@ mod tests {
         );
         let dir = old_data_dir(&[STEP06_SCHEMA, &row], &[(&id, &blob)]);
         let s = Server {
-            app: Arc::new(App::open(&dir.0).expect("a step 06 data directory did not open")),
+            app: Arc::new(open(&dir.0).expect("a step 06 data directory did not open")),
             dir,
         };
         assert_eq!(user_version(s.app.db().conn()), 5);
@@ -540,7 +609,7 @@ mod tests {
             "INSERT INTO uploads (uploader_id, size, created_at) VALUES ('alice', 1, {now})"
         );
         let dir = step07(&[&file, &ledger]);
-        let err = App::open(&dir.0)
+        let err = open(&dir.0)
             .err()
             .expect("a database holding member names opened")
             .to_string();
@@ -576,7 +645,7 @@ mod tests {
             now + 3600
         );
         let dir = step07(&[&file]);
-        let app = App::open(&dir.0).expect("a step 07 database with no member names did not open");
+        let app = open(&dir.0).expect("a step 07 database with no member names did not open");
         assert_eq!(user_version(app.db().conn()), 5);
     }
 
@@ -592,7 +661,7 @@ mod tests {
         let Server { app, dir } = s;
         drop(app);
 
-        let err = App::open(&dir.0)
+        let err = open(&dir.0)
             .err()
             .expect("a database from a newer binary opened")
             .to_string();
@@ -616,8 +685,9 @@ mod tests {
     /// Db::write takes the write lock when the transaction begins, so racers that
     /// read and then write queue rather than fail. Sixteen connections each insert
     /// only if the table is empty: exactly one row, and no racer gets an error. A
-    /// deferred transaction fails most of them with SQLITE_BUSY. So far the only
-    /// read-then-write transaction is migration 4; the quota check will depend on this.
+    /// deferred transaction fails most of them with SQLITE_BUSY. Migration 4 and
+    /// the quota check in `insert` read and then write; `quota_race_across_connections`
+    /// is this for the quota.
     #[test]
     fn write_transactions_queue() {
         let dir = TempDir::new();
@@ -680,9 +750,18 @@ mod tests {
             expires_at: now + 3600,
             max_downloads: 1,
         };
+        let uploader = &test_config().members[0];
         for id in ids.iter() {
-            db.insert(id, &crate::app::OwnerToken::random().hash(), 1, now, limits)
-                .unwrap();
+            db.insert(
+                id,
+                &crate::app::OwnerToken::random().hash(),
+                1,
+                now,
+                limits,
+                uploader,
+            )
+            .unwrap()
+            .unwrap();
         }
         let barrier = Arc::new(std::sync::Barrier::new(RACERS));
         let racers: Vec<_> = (0..RACERS)
@@ -725,6 +804,267 @@ mod tests {
             )
             .unwrap();
         assert_eq!((downloads, in_flight), (ROUNDS as i64, ROUNDS as i64));
+    }
+
+    /// Sixteen connections race to store a file where the member's quota has
+    /// room for one, round after round: exactly one lands each time, and none
+    /// fails. Separate connections, as for the claim, because the one mutexed
+    /// connection would serialise a check that is not in the transaction.
+    #[test]
+    fn quota_race_across_connections() {
+        const ROUNDS: usize = 50;
+        const RACERS: usize = 16;
+        let dir = TempDir::new();
+        let path = dir.0.join("sunbird.db");
+        drop(Db::open(&path).unwrap());
+        let now = now();
+        let limits = Limits {
+            expires_at: now + 3600,
+            max_downloads: 0,
+        };
+        let members: Arc<Vec<_>> = Arc::new(
+            (0..ROUNDS)
+                .map(|_| {
+                    let id = crate::config::MemberId::mint().to_string();
+                    config(vec![member(&id, "m", &id, [1000, LOTS, LOTS])], |_| {})
+                        .members
+                        .remove(0)
+                })
+                .collect(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+        let racers: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let (path, barrier, members) = (path.clone(), barrier.clone(), members.clone());
+                std::thread::spawn(move || {
+                    let mut db = Db::open(&path).unwrap();
+                    db.conn()
+                        .busy_handler(Some(|tries| {
+                            std::thread::sleep(std::time::Duration::from_micros(50));
+                            tries < 1_000_000
+                        }))
+                        .unwrap();
+                    let owner = crate::app::OwnerToken::random().hash();
+                    members
+                        .iter()
+                        .map(|m| {
+                            barrier.wait();
+                            db.insert(&FileId::random(), &owner, 600, now, limits, m)
+                                .map(|stored| stored.is_ok())
+                                .map_err(|e| e.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        for round in 0..ROUNDS {
+            let tries: Vec<_> = results.iter().map(|r| &r[round]).collect();
+            let failed: Vec<_> = tries.iter().filter_map(|t| t.as_ref().err()).collect();
+            assert!(
+                failed.is_empty(),
+                "round {round}: {} failed: {}",
+                failed.len(),
+                failed[0]
+            );
+            let landed = tries.iter().filter(|t| matches!(t, Ok(true))).count();
+            assert_eq!(landed, 1, "round {round}: files stored with room for one");
+        }
+    }
+
+    /// tests/fixtures/r2 is a data directory made by this repository's R2
+    /// server, through its HTTP API, before uploads were authenticated
+    /// (manifest beside it). Its schema is version 5, which already has what
+    /// authentication stores, uploader_id and the upload ledger, so opening it
+    /// under R3 runs no migration, and changes neither schema nor rows. Its
+    /// files have no uploader: they are served as before, deleted by their
+    /// owner tokens, count against no member's quota, and can be taken down by
+    /// an admin, logged as having no uploader.
+    #[tokio::test]
+    async fn r2_directory_opens_under_auth() {
+        capture_logs();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read("tests/fixtures/r2.json").unwrap()).unwrap();
+        let made_at = manifest["made_at"].as_i64().unwrap();
+        let file = |label: &str| {
+            manifest["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["label"] == label)
+                .unwrap()
+                .clone()
+        };
+        let dir = TempDir::new();
+        copy_dir(Path::new("tests/fixtures/r2"), &dir.0);
+        let before = rusqlite::Connection::open(dir.0.join("sunbird.db")).unwrap();
+        let (schema_before, version_before) = (schema(&before), user_version(&before));
+        let dump = |db: &rusqlite::Connection| -> Vec<String> {
+            db.prepare("SELECT * FROM blobs ORDER BY id")
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((0..r.as_ref().column_count())
+                        .map(|i| format!("{:?}", r.get::<_, rusqlite::types::Value>(i).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join(" "))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let rows_before = dump(&before);
+        drop(before);
+        assert_eq!(version_before, 5);
+        assert!(
+            !rows_before.is_empty() && rows_before.iter().all(|r| r.ends_with("Null")),
+            "{rows_before:?}"
+        );
+
+        let tiny = config(
+            vec![member(MEMBER_ID, "m", MEMBER_TOKEN, [100, 1, 100])],
+            |_| {},
+        );
+        let mut app = App::open(&dir.0, tiny).expect("the R2 directory did not open");
+        app.now = || 1_790_624_430; // the manifest's made_at
+        assert_eq!(
+            (app.now)(),
+            made_at,
+            "the clock is not the manifest's made_at"
+        );
+        let s = Server {
+            app: Arc::new(app),
+            dir,
+        };
+        {
+            let db = s.app.db();
+            assert_eq!(user_version(db.conn()), 5);
+            assert!(
+                schema(db.conn()) == schema_before,
+                "opening changed the schema"
+            );
+            assert!(dump(db.conn()) == rows_before, "opening changed a row");
+        }
+        for f in manifest["files"].as_array().unwrap() {
+            let r = get(&s, &format!("/api/meta/{}", f["id"].as_str().unwrap())).await;
+            let want = match f["state"].as_str().unwrap() {
+                "gone" => StatusCode::NOT_FOUND,
+                _ => StatusCode::OK,
+            };
+            assert_eq!(r.status, want, "{}", f["label"]);
+        }
+
+        // A member whose whole quota is 100 bytes and one file still has it all.
+        let r = send(
+            &s,
+            "POST",
+            &format!("/api/upload?expires_at={}&max_downloads=0", made_at + 3600),
+            Source::bytes(&random_blob(100)),
+            MEMBER_TOKEN,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&r.body)
+        );
+
+        let two = file("two-downloads");
+        let r = send(
+            &s,
+            "DELETE",
+            &format!("/api/{}", two["id"].as_str().unwrap()),
+            Source::bytes(b""),
+            two["ownerToken"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::NO_CONTENT,
+            "owner delete with an R2 owner token"
+        );
+
+        let present = file("present");
+        let id = present["id"].as_str().unwrap();
+        let r = get(&s, &format!("/api/download/{id}")).await;
+        let digest: String = Sha256::digest(&r.body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            digest,
+            present["sha256"].as_str().unwrap(),
+            "downloaded bytes"
+        );
+        let r = send(
+            &s,
+            "DELETE",
+            &format!("/api/admin/{id}"),
+            Source::bytes(b""),
+            ADMIN_TOKEN,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        let said = logged(id);
+        assert!(
+            said.len() == 1
+                && said[0].1.contains(ADMIN_ID)
+                && said[0].1.contains(
+                    "uploaded by nobody: it was uploaded before uploads were authenticated"
+                ),
+            "{said:?}"
+        );
+    }
+
+    /// The schema v5 fixture came from a server that already authenticated
+    /// uploads, and recorded its uploader by member id, in the format
+    /// `mint-id` makes. Under a config listing that id, the files and the
+    /// ledger are that member's: four files stored, and 80,200 bytes uploaded
+    /// this week, the two since deleted included.
+    #[tokio::test]
+    async fn schema_v5_uploader_is_a_member_id() {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read("tests/fixtures/schema-v5.json").unwrap()).unwrap();
+        let uploader = manifest["uploader_id"].as_str().unwrap();
+        let path = format!(
+            "/api/upload?expires_at={}&max_downloads=0",
+            1_790_584_249 + 3600
+        );
+        for (quota, want) in [
+            (
+                [LOTS, 4, LOTS],
+                "You have 4 files stored, and your limit is 4 at once.",
+            ),
+            (
+                [LOTS, LOTS, 80_200],
+                "You have uploaded 80200 of your 80200 bytes allowed per 7 days.",
+            ),
+            (
+                [80_100, LOTS, LOTS],
+                "Your files take 79100 of your 80100 bytes stored at once.",
+            ),
+        ] {
+            let dir = TempDir::new();
+            copy_dir(Path::new("tests/fixtures/schema-v5"), &dir.0);
+            let c = config(vec![member(uploader, "m", MEMBER_TOKEN, quota)], |_| {});
+            let mut app = App::open(&dir.0, c).unwrap();
+            app.now = || 1_790_584_249;
+            let s = Server {
+                app: Arc::new(app),
+                dir,
+            };
+            let r = send(
+                &s,
+                "POST",
+                &path,
+                Source::bytes(&random_blob(1001)),
+                MEMBER_TOKEN,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{want}");
+            let error = r.json()["error"].as_str().unwrap().to_owned();
+            assert!(error.starts_with(want), "{error}");
+        }
     }
 
     fn copy_dir(from: &Path, to: &Path) {
@@ -800,7 +1140,7 @@ mod tests {
         );
         drop(before);
 
-        let mut app = App::open(&dir.0).expect("the schema v5 directory did not open");
+        let mut app = open(&dir.0).expect("the schema v5 directory did not open");
         app.now = || 1_790_584_249; // the manifest's made_at
         let s = Server {
             app: Arc::new(app),
@@ -828,7 +1168,7 @@ mod tests {
         }
         let fresh = TempDir::new();
         assert!(
-            schema(App::open(&fresh.0).unwrap().db().conn()) == schema_before,
+            schema(open(&fresh.0).unwrap().db().conn()) == schema_before,
             "the migrations no longer produce schema v5"
         );
 

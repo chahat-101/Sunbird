@@ -1,0 +1,51 @@
+{
+  "made_by": "this repository's R2 server (commit 8d1d98c), through its HTTP API, before uploads were authenticated; the database checkpointed and closed after the server stopped",
+  "made_at": 1790624430,
+  "files": [
+    {
+      "label": "present",
+      "id": "amQM-eE-_GL-s69t",
+      "ownerToken": "bXXcwN6v1dEI8g1UU4qKvsVmBVuc8715FYJjKRZJw-U",
+      "size": 5000,
+      "seed": 1,
+      "sha256": "e8c3dc6aac3f1dabbd6c68ddbd94885ee2c887f2f535e759f518fef17fe2874b",
+      "expires_at": 1791142830,
+      "max_downloads": 0,
+      "state": "present"
+    },
+    {
+      "label": "two-downloads",
+      "id": "wB0ZAGH8hv6TurXG",
+      "ownerToken": "pe6_UeWLWIE1cncjbmI8gy7e9iWpfcPicGU5JQLQkPA",
+      "size": 20000,
+      "seed": 2,
+      "sha256": "8b6c570d72d14d38dfddb0bc20d20ceeb4029664b9771107a5b51443b6c4e382",
+      "expires_at": 1791142830,
+      "max_downloads": 2,
+      "state": "present",
+      "downloads": 1
+    },
+    {
+      "label": "used-up",
+      "id": "kepRwCQRabJ1sf4H",
+      "ownerToken": "PvF6BTZVJdNZVkgGAdUO6rnuTpTNcMwdiqziO-lCo3k",
+      "size": 300,
+      "seed": 3,
+      "sha256": "aae1729f1b920aa5c53be766ab2a82583417ac457f5d861e5ba9c56633d7253e",
+      "expires_at": 1791142830,
+      "max_downloads": 1,
+      "state": "gone"
+    },
+    {
+      "label": "owner-deleted",
+      "id": "hX2FjCY53DqNsSZ-",
+      "ownerToken": "F1U51OZkqpmoU1mkQ1feWMZQVQFfE1rDHjfoqGxXKDo",
+      "size": 700,
+      "seed": 4,
+      "sha256": "e2cf550eea5fc613e64d22876d19cea855721cf652a05e54c7f1f0c25ffecbb9",
+      "expires_at": 1791142830,
+      "max_downloads": 0,
+      "state": "gone"
+    }
+  ]
+}

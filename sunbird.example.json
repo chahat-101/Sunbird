@@ -1,0 +1,31 @@
+{
+  "note": "An example, not a recommendation. Every number in this file is an illustration picked to show the shape, not a tested or suggested limit: choose your own for your disk, your members and your link. The server has no defaults, so every limit shown is required. Ids come from `sunbird mint-id`, token_sha256 from `sunbird mint-token`; the tokens behind these hashes were thrown away. List a proxy in trusted_proxies only if it sits in front of the server and appends the client address to X-Forwarded-For; with none listed the header is ignored.",
+  "members": [
+    {
+      "id": "8vz8r7kvqyPiE3qUD-vsNg",
+      "name": "Example member",
+      "token_sha256": "73dd88e4bc906b69a453be060442bbb179cbbad9147b257308277a8b5647bc10",
+      "max_active_bytes": 1073741824,
+      "max_active_files": 20,
+      "max_bytes_per_week": 2147483648
+    },
+    {
+      "id": "tvLt-v2h3ljNvOJ0a8Txcg",
+      "name": "Another member",
+      "token_sha256": "0d57eaab97d7c6671b51466ca2d3c03ff2664a5d77cae6acecca5d0063af5ea3",
+      "max_active_bytes": 524288000,
+      "max_active_files": 10,
+      "max_bytes_per_week": 1073741824
+    }
+  ],
+  "admins": [
+    {
+      "id": "qOJ_9WlSnD5Ssm-3ynu9Sw",
+      "name": "Example admin",
+      "token_sha256": "464fe74bd5fb664d308172accf5072214b86e530a115f97c2a100e74b2a41ad8"
+    }
+  ],
+  "trusted_proxies": [],
+  "upload_rate": { "requests": 30, "seconds": 3600 },
+  "read_rate": { "requests": 120, "seconds": 60 }
+}
