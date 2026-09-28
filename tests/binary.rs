@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,12 +22,18 @@ impl Drop for Running {
 }
 
 fn start() -> Running {
+    start_with(|_| {})
+}
+
+/// Starts the binary once `prepare` has had its data directory.
+fn start_with(prepare: impl FnOnce(&Path)) -> Running {
     let dir = std::env::temp_dir().join(format!(
         "sunbird-binary-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    prepare(&dir.join("data"));
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -120,4 +126,47 @@ fn declared_length_over_max_blob_refused_before_the_body() {
             .is_none(),
         "tmp/ is not empty"
     );
+}
+
+/// The sweeper runs at startup, not only once its first interval has passed: a
+/// file that expired while the server was down is deleted with no request for
+/// it, blob and row.
+#[test]
+fn sweeps_at_startup() {
+    let blob = |data: &Path| data.join("blobs/000000000000000000000000");
+    let s = start_with(|data| {
+        // A schema version 5 database, with one file that expired long ago.
+        std::fs::copy(
+            "tests/fixtures/schema-v5/sunbird.db",
+            data.join("sunbird.db"),
+        )
+        .unwrap();
+        let db = rusqlite::Connection::open(data.join("sunbird.db")).unwrap();
+        db.execute(
+            "INSERT INTO blobs (id, owner_token_hash, size, created_at, expires_at, max_downloads)
+             VALUES ('AAAAAAAAAAAAAAAA', x'00', 1, 1, 2, 0)",
+            [],
+        )
+        .unwrap();
+        std::fs::create_dir(data.join("blobs")).unwrap();
+        std::fs::write(blob(data), "x").unwrap();
+    });
+    let data = s.dir.join("data");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while blob(&data).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the expired blob is still on disk"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let db = rusqlite::Connection::open(data.join("sunbird.db")).unwrap();
+    let rows: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM blobs WHERE id = 'AAAAAAAAAAAAAAAA'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "the expired row");
 }

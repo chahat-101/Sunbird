@@ -133,8 +133,8 @@ impl OwnerTokenHash {
 /// header cannot be rewritten, and an adjusted row would promise something the
 /// verified header does not.
 ///
-/// Validated and stored now, so every row carries the limits its uploader
-/// sealed. Enforcing them on read comes with expiry (session 02).
+/// The first limit reached wins: past expires_at, or max_downloads completed
+/// (0: no download limit), the file is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub expires_at: i64,
@@ -203,7 +203,9 @@ fn system_clock() -> i64 {
 impl App {
     /// Creates the layout if needed, opens and migrates the database, and
     /// clears what a previous process left behind: partial uploads in tmp/,
-    /// and blobs with no row.
+    /// download claims still in flight, and blobs with no row.
+    ///
+    /// It does not sweep: `sweep` judges by `now`, which a test sets after this.
     pub fn open(dir: &Path) -> Result<App, Error> {
         for sub in ["blobs", "tmp"] {
             DirBuilder::new()
@@ -216,6 +218,12 @@ impl App {
             fs::remove_file(entry?.path())?;
         }
         let db = Db::open(&dir.join("sunbird.db"))?;
+        let refunded = db.refund_in_flight()?;
+        if refunded > 0 {
+            log::warn!(
+                "refunded downloads left in flight by the previous process, on {refunded} files"
+            );
+        }
         let app = App {
             dir: dir.to_owned(),
             db: Mutex::new(db),
@@ -290,18 +298,71 @@ impl App {
     }
 
     /// Deletes a file already marked deleting: the blob, then the row. The mark
-    /// came first, so the file stopped being served before any bytes went. If
-    /// the unlink fails the row stays marked, never served again.
+    /// came first, so the file stopped being served before any bytes went.
+    ///
+    /// The deletion is verified: after the unlink, the blob must be gone from
+    /// the directory, and that check, not what the unlink returned, decides.
+    /// If the blob is still there, or the check itself fails, it is logged as
+    /// an error and the row stays marked, never served again, for the next
+    /// sweep to retry. A crash between the steps leaves the same state.
+    ///
+    /// A download still streaming the blob is not stopped. On POSIX an unlinked
+    /// file lives on for the descriptors already open on it, so that transfer
+    /// completes and then the bytes go. Nothing locks against that.
     pub fn purge(&self, id: &FileId) -> Result<(), Error> {
-        match fs::remove_file(self.blob_path(id)) {
-            Err(e) if e.kind() != ErrorKind::NotFound => {
+        let path = self.blob_path(id);
+        let unlinked = fs::remove_file(&path);
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(self.db().remove(id)?),
+            Ok(_) => {
+                let why = match unlinked {
+                    Err(e) => e.to_string(),
+                    Ok(()) => "the unlink reported success".into(),
+                };
                 log::error!(
-                    "DELETION FAILED: file {id} is no longer served, but its blob is still on disk: {e}"
+                    "DELETION FAILED: file {id} is no longer served, but its blob is still on disk at {}: {why}",
+                    path.display()
+                );
+                Err(format!("file {id}: blob still on disk").into())
+            }
+            Err(e) => {
+                log::error!(
+                    "DELETION FAILED: file {id} is no longer served, but whether its blob at {} is gone cannot be checked: {e}",
+                    path.display()
                 );
                 Err(e.into())
             }
-            _ => Ok(self.db().remove(id)?),
         }
+    }
+
+    /// Ends a download claimed with `Db::claim`, counted if `completed` and
+    /// refunded if not, and purges the file if that used it up.
+    pub fn end_download(&self, id: &FileId, completed: bool) {
+        // Bound first: a guard in the match would be held into `purge`, which
+        // locks the database again, and deadlock.
+        let ended = self.db().end_download(id, completed);
+        match ended {
+            Ok(true) => {
+                let _ = self.purge(id); // logged; the sweeper retries
+            }
+            Ok(false) => {}
+            // The claim stays in flight: the file is not purged, and a refund
+            // waits for the next start.
+            Err(e) => log::error!("file {id}: could not record the end of a download: {e}"),
+        }
+    }
+
+    /// Deletes every file past its limits, and retries every earlier deletion
+    /// that failed. Marks first, so the files stop being served, then purges.
+    /// Returns how many were deleted and how many could not be.
+    pub fn sweep(&self) -> Result<(usize, usize), Error> {
+        let marked = {
+            let db = self.db();
+            db.mark_spent((self.now)())?;
+            db.marked()?
+        };
+        let failed = marked.iter().filter(|id| self.purge(id).is_err()).count();
+        Ok((marked.len() - failed, failed))
     }
 
     /// Deletes blobs with no row: an upload linked its file and the process
@@ -331,7 +392,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     use hyper::StatusCode;
 
@@ -417,9 +480,10 @@ mod tests {
         assert_eq!(rows(&s), 2);
     }
 
-    /// The crash points there are so far, reconstructed on disk, then a restart: a blob
-    /// linked but never given a row, and a row marked deleting whose blob was not
-    /// yet unlinked. (Refunds and the sweep that finishes a marked file come with expiry.)
+    /// The crash points, reconstructed on disk, then a restart: a blob linked but
+    /// never given a row, a download claimed whose transfer never ended, and a
+    /// row marked deleting whose blob was not yet unlinked, which the first sweep
+    /// finishes.
     #[tokio::test]
     async fn restart_after_crash() {
         let s = server();
@@ -429,6 +493,21 @@ mod tests {
             .conn()
             .execute("UPDATE blobs SET deleting = 1 WHERE id = ?", [&marked.id])
             .unwrap();
+        let blob = random_blob(1000);
+        let claimed = upload_with(
+            &s,
+            &format!("/api/upload?expires_at={}&max_downloads=1", now() + 3600),
+            &blob,
+        )
+        .await;
+        assert!(
+            s.app
+                .db()
+                .claim(&FileId::parse(&claimed.id).unwrap(), now())
+                .unwrap()
+                .is_some(),
+            "claim"
+        );
         let orphan = s.dir.0.join("blobs").join(FileId::random().hex());
         fs::write(&orphan, random_blob(1000)).unwrap();
         let stray = s.dir.0.join("blobs").join("not-an-id");
@@ -468,5 +547,131 @@ mod tests {
             blob_exists(&s, &marked.id),
             "a marked file's blob has a row and must survive open"
         );
+        assert_eq!(
+            counts(&s, &claimed.id),
+            Some((0, 0, 0)),
+            "a claim left in flight, after open"
+        );
+        let r = get(&s, &format!("/api/download/{}", claimed.id)).await;
+        assert!(
+            r.status == StatusCode::OK && r.body == blob,
+            "the refunded download: {}",
+            r.status
+        );
+
+        assert_eq!(s.app.sweep().unwrap().1, 0, "sweep failures");
+        assert!(
+            !blob_exists(&s, &marked.id) && counts(&s, &marked.id).is_none(),
+            "the sweep did not finish the marked file"
+        );
+    }
+
+    const T0: i64 = 1_800_000_000;
+
+    /// The sweeper deletes a file past expires_at that nobody asks for again:
+    /// blob, then row, and the blob is checked gone. Files within their limits
+    /// stay.
+    #[tokio::test]
+    async fn sweep_deletes_expired() {
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        let s = server_with(|app| app.now = || CLOCK.load(Ordering::Relaxed));
+        let path = |expires_at: i64, max_downloads: u32| {
+            format!("/api/upload?expires_at={expires_at}&max_downloads={max_downloads}")
+        };
+        let expiring = upload_with(&s, &path(T0 + 60, 0), &random_blob(1000)).await;
+        let limited = upload_with(&s, &path(T0 + 7200, 3), &random_blob(1000)).await;
+        let unlimited = upload_with(&s, &path(T0 + 7200, 0), &random_blob(1000)).await;
+
+        CLOCK.store(T0 + 59, Ordering::Relaxed);
+        assert_eq!(s.app.sweep().unwrap(), (0, 0), "a second before expires_at");
+        CLOCK.store(T0 + 60, Ordering::Relaxed);
+        assert_eq!(
+            s.app.sweep().unwrap(),
+            (1, 0),
+            "at expires_at: deleted, failed"
+        );
+        assert!(
+            fs::symlink_metadata(s.app.blob_path(&FileId::parse(&expiring.id).unwrap()))
+                .is_err_and(|e| e.kind() == ErrorKind::NotFound),
+            "the expired blob is still on disk"
+        );
+        assert_eq!(counts(&s, &expiring.id), None, "the expired row");
+        for u in [&limited, &unlimited] {
+            assert_eq!(
+                get(&s, &format!("/api/meta/{}", u.id)).await.status,
+                StatusCode::OK,
+                "a live file after the sweep"
+            );
+        }
+        assert_eq!((rows(&s), entries(&s, "blobs")), (2, 2));
+    }
+
+    /// Restores a directory's permissions when the test ends, pass or fail, so
+    /// it can be removed.
+    struct Writable(std::path::PathBuf);
+
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// A deletion that fails is logged as an error, every time it is tried, and
+    /// the file stays marked, never served, until one succeeds. Forced here with
+    /// a blobs directory that refuses the unlink.
+    #[tokio::test]
+    async fn failed_deletion_is_logged_and_retried() {
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        capture_logs();
+        let s = server_with(|app| app.now = || CLOCK.load(Ordering::Relaxed));
+        let u = upload_with(
+            &s,
+            &format!("/api/upload?expires_at={}&max_downloads=0", T0 + 60),
+            &random_blob(1000),
+        )
+        .await;
+        CLOCK.store(T0 + 60, Ordering::Relaxed);
+
+        let blobs = s.dir.0.join("blobs");
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o500)).unwrap();
+        let writable = Writable(blobs);
+        for attempt in 1..=2 {
+            assert_eq!(
+                s.app.sweep().unwrap(),
+                (0, 1),
+                "attempt {attempt}: deleted, failed"
+            );
+            let failures: Vec<_> = logged(&u.id)
+                .into_iter()
+                .filter(|(level, message)| {
+                    *level == log::Level::Error && message.starts_with("DELETION FAILED")
+                })
+                .collect();
+            assert_eq!(
+                failures.len(),
+                attempt,
+                "attempt {attempt}: logged failures"
+            );
+            assert_eq!(
+                counts(&s, &u.id),
+                Some((0, 0, 1)),
+                "attempt {attempt}: the row, still marked"
+            );
+            assert!(blob_exists(&s, &u.id));
+        }
+        CLOCK.store(T0, Ordering::Relaxed);
+        assert_eq!(
+            get(&s, &format!("/api/meta/{}", u.id)).await.status,
+            StatusCode::NOT_FOUND,
+            "a marked file, served again once its clock says live"
+        );
+
+        drop(writable);
+        assert_eq!(
+            s.app.sweep().unwrap(),
+            (1, 0),
+            "once the unlink can succeed"
+        );
+        assert!(!blob_exists(&s, &u.id) && counts(&s, &u.id).is_none());
     }
 }

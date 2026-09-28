@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
+};
 
 use crate::app::{FileId, Limits, OwnerTokenHash};
 
@@ -44,9 +46,12 @@ const MIGRATIONS: [Migration; 5] = [
 ];
 
 /// The one definition of a file that exists, used by every endpoint. A file
-/// that fails it gets the same 404 as an ID never issued. Expiry (session 02)
-/// adds expired and used up.
-const SERVABLE: &str = "deleting = 0";
+/// that fails it gets the same 404 as an ID never issued: marked for deletion,
+/// expired (the clock at or past expires_at), or used up (every allowed
+/// download claimed, those still in flight included). max_downloads 0 is no
+/// download limit, not zero downloads. Binds :now.
+const SERVABLE: &str =
+    "deleting = 0 AND expires_at > :now AND (max_downloads = 0 OR downloads < max_downloads)";
 
 pub struct Db(Connection);
 
@@ -160,24 +165,104 @@ impl Db {
     }
 
     /// The size of a servable file.
-    pub fn size(&self, id: &FileId) -> rusqlite::Result<Option<u64>> {
+    pub fn size(&self, id: &FileId, now: i64) -> rusqlite::Result<Option<u64>> {
         self.0
             .query_row(
-                &format!("SELECT size FROM blobs WHERE id = ? AND {SERVABLE}"),
-                [id.to_string()],
+                &format!("SELECT size FROM blobs WHERE id = :id AND {SERVABLE}"),
+                named_params! { ":id": id.to_string(), ":now": now },
                 |r| r.get::<_, i64>(0),
             )
             .optional()
             .map(|size| size.map(|s| s as u64))
     }
 
+    /// Claims one download of a servable file and returns its size, or None if
+    /// it is not servable. The check and the claim are one statement, so two
+    /// racers for a file's last download cannot both see it available: a SELECT
+    /// and then an UPDATE would let them. The claim counts at once, so the file
+    /// stops being servable while its last download is still in flight;
+    /// `end_download` refunds it if the transfer fails.
+    pub fn claim(&mut self, id: &FileId, now: i64) -> Result<Option<u64>, Error> {
+        self.write(|tx| {
+            let size = tx
+                .query_row(
+                    &format!(
+                        "UPDATE blobs SET downloads = downloads + 1, in_flight = in_flight + 1
+                         WHERE id = :id AND {SERVABLE} RETURNING size"
+                    ),
+                    named_params! { ":id": id.to_string(), ":now": now },
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            Ok(size.map(|s| s as u64))
+        })
+    }
+
+    /// Ends a claimed download: it stays counted if `completed`, and is
+    /// refunded if not. True if that left the file used up with no transfer in
+    /// flight, in which case it is now marked, for the caller to purge. A file
+    /// is not marked while a claim is in flight: that transfer may yet fail and
+    /// be refunded, and the file must then still be there.
+    pub fn end_download(&mut self, id: &FileId, completed: bool) -> Result<bool, Error> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE blobs SET in_flight = in_flight - 1, downloads = downloads - ?2
+                 WHERE id = ?1 AND in_flight > 0",
+                params![id.to_string(), i64::from(!completed)],
+            )?;
+            Ok(tx.execute(
+                "UPDATE blobs SET deleting = 1
+                 WHERE id = ? AND deleting = 0 AND in_flight = 0
+                   AND max_downloads > 0 AND downloads >= max_downloads",
+                [id.to_string()],
+            )? == 1)
+        })
+    }
+
+    /// Marks every file that is expired, or used up with no transfer in
+    /// flight: the sweeper's first step. Returns how many.
+    pub fn mark_spent(&self, now: i64) -> rusqlite::Result<usize> {
+        self.0.execute(
+            "UPDATE blobs SET deleting = 1
+             WHERE deleting = 0 AND (expires_at <= ?
+               OR (max_downloads > 0 AND downloads >= max_downloads AND in_flight = 0))",
+            [now],
+        )
+    }
+
+    /// Every file marked for deletion: those just marked, and those whose
+    /// deletion failed or was cut short by a crash.
+    pub fn marked(&self) -> Result<Vec<FileId>, Error> {
+        let ids: Vec<String> = self
+            .0
+            .prepare("SELECT id FROM blobs WHERE deleting = 1")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                FileId::parse(&id).ok_or_else(|| format!("stored id {id:?} is malformed").into())
+            })
+            .collect()
+    }
+
+    /// Refunds every claim still in flight. Only at startup, when no transfer
+    /// can be: those claims belong to a process that stopped before their
+    /// transfers ended, and a transfer not known to have completed does not
+    /// count. Returns how many files had one.
+    pub fn refund_in_flight(&self) -> rusqlite::Result<usize> {
+        self.0.execute(
+            "UPDATE blobs SET downloads = downloads - in_flight, in_flight = 0 WHERE in_flight > 0",
+            [],
+        )
+    }
+
     /// The owner token hash of a servable file.
-    pub fn owner(&self, id: &FileId) -> Result<Option<OwnerTokenHash>, Error> {
+    pub fn owner(&self, id: &FileId, now: i64) -> Result<Option<OwnerTokenHash>, Error> {
         let stored: Option<Vec<u8>> = self
             .0
             .query_row(
-                &format!("SELECT owner_token_hash FROM blobs WHERE id = ? AND {SERVABLE}"),
-                [id.to_string()],
+                &format!("SELECT owner_token_hash FROM blobs WHERE id = :id AND {SERVABLE}"),
+                named_params! { ":id": id.to_string(), ":now": now },
                 |r| r.get(0),
             )
             .optional()?;
@@ -257,7 +342,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::app::{App, FileId};
+    use crate::app::{App, FileId, Limits};
     use crate::http::tests::*;
 
     /// A data directory as an earlier step of the original server left it.
@@ -314,7 +399,7 @@ mod tests {
 
     /// A step 05 file's limits are sealed where the server cannot read them, so
     /// the migration guesses, and the guess errs toward less access: D9's 24 hours
-    /// and one download. (Serving the file once and then no more comes with expiry.)
+    /// and one download. The file is served once and then no more.
     #[tokio::test]
     async fn migrate_step05_database() {
         let now = now();
@@ -363,6 +448,15 @@ mod tests {
             "download of a migrated file: {}",
             r.status
         );
+        wait_until("the used-up file is deleted", || {
+            counts(&s, &recent).is_none()
+        })
+        .await;
+        assert_eq!(
+            get(&s, &format!("/api/download/{recent}")).await.status,
+            StatusCode::NOT_FOUND,
+            "second download of a migrated file"
+        );
         let r = send(
             &s,
             "DELETE",
@@ -388,7 +482,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (user_version(db.conn()), rows),
-            (5, 1),
+            (5, 0),
             "second open: version, rows"
         );
     }
@@ -568,6 +662,71 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
+    /// Sixteen connections race for a 1-download file's only claim, round after
+    /// round: exactly one wins each, and none fails. Separate connections, as a
+    /// pool would have, so the one mutexed connection cannot hide a claim that
+    /// checks in one statement and claims in the next; that loses within a few
+    /// rounds.
+    #[test]
+    fn claim_race_across_connections() {
+        const ROUNDS: usize = 200;
+        const RACERS: usize = 16;
+        let dir = TempDir::new();
+        let path = dir.0.join("sunbird.db");
+        let now = now();
+        let mut db = Db::open(&path).unwrap();
+        let ids: Arc<Vec<FileId>> = Arc::new((0..ROUNDS).map(|_| FileId::random()).collect());
+        let limits = Limits {
+            expires_at: now + 3600,
+            max_downloads: 1,
+        };
+        for id in ids.iter() {
+            db.insert(id, &crate::app::OwnerToken::random().hash(), 1, now, limits)
+                .unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+        let racers: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let (path, barrier, ids) = (path.clone(), barrier.clone(), ids.clone());
+                std::thread::spawn(move || {
+                    let mut db = Db::open(&path).unwrap();
+                    // SQLite's own busy handler backs off to 100 ms a try, and
+                    // sixteen racers queue on one lock every round. Retrying every
+                    // 50 µs waits for the same lock, and takes seconds, not minutes.
+                    db.conn()
+                        .busy_handler(Some(|tries| {
+                            std::thread::sleep(std::time::Duration::from_micros(50));
+                            tries < 1_000_000
+                        }))
+                        .unwrap();
+                    ids.iter()
+                        .map(|id| {
+                            barrier.wait();
+                            db.claim(id, now).map_err(|e| e.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        for round in 0..ROUNDS {
+            let claims: Vec<_> = results.iter().map(|r| &r[round]).collect();
+            let failed: Vec<_> = claims.iter().filter_map(|c| c.as_ref().err()).collect();
+            assert!(failed.is_empty(), "round {round}: {:?}", failed[0]);
+            let won = claims.iter().filter(|c| matches!(c, Ok(Some(_)))).count();
+            assert_eq!(won, 1, "round {round}: claims won of a 1-download file");
+        }
+        let (downloads, in_flight): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT SUM(downloads), SUM(in_flight) FROM blobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((downloads, in_flight), (ROUNDS as i64, ROUNDS as i64));
+    }
+
     fn copy_dir(from: &Path, to: &Path) {
         fs::create_dir_all(to).unwrap();
         for entry in fs::read_dir(from).unwrap() {
@@ -593,6 +752,9 @@ mod tests {
     /// was produced before this rewrite, through a server's HTTP API: files
     /// uploaded, one downloaded, two gone (manifest beside it). It is live data
     /// in miniature, as a migration later will meet it.
+    ///
+    /// Its files expire on 2026-10-05, so the server's clock is set to when it
+    /// was made, not left to today's date.
     ///
     /// Version 5 is the current version, so opening it runs no migration. What
     /// this proves: opening a directory that already holds rows and blobs
@@ -638,8 +800,10 @@ mod tests {
         );
         drop(before);
 
+        let mut app = App::open(&dir.0).expect("the schema v5 directory did not open");
+        app.now = || 1_790_584_249; // the manifest's made_at
         let s = Server {
-            app: Arc::new(App::open(&dir.0).expect("the schema v5 directory did not open")),
+            app: Arc::new(app),
             dir,
         };
         {

@@ -20,6 +20,11 @@ use tokio::net::TcpListener;
 
 use crate::app::App;
 
+/// How often the sweeper runs. A file past its limits is refused from the
+/// moment it is (the check is on every read); this bounds only how long its
+/// bytes stay on disk after that.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
 struct Flags {
     addr: String,
     data: PathBuf,
@@ -93,14 +98,35 @@ async fn main() -> ExitCode {
             config.display()
         );
     }
-    log::warn!(
-        "uploads are not authenticated and expiry is not enforced yet; do not expose this server"
-    );
+    log::warn!("uploads are not authenticated yet; do not expose this server");
     log::info!(
         "listening on {}, data in {}",
         flags.addr,
         flags.data.display()
     );
+
+    // The first tick is immediate: a sweep at startup, then one every
+    // SWEEP_EVERY. Without it, a file nobody asks for again would be kept
+    // forever: nothing else deletes an expired file.
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut every = tokio::time::interval(SWEEP_EVERY);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                let app = app.clone();
+                match tokio::task::spawn_blocking(move || app.sweep()).await {
+                    Ok(Ok((0, 0))) => {}
+                    Ok(Ok((deleted, failed))) => {
+                        log::info!("sweep: deleted {deleted} files, {failed} could not be")
+                    }
+                    Ok(Err(e)) => log::error!("sweep: {e}"),
+                    Err(e) => log::error!("sweep panicked: {e}"),
+                }
+            }
+        }
+    });
 
     loop {
         let stream = match listener.accept().await {

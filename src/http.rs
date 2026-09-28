@@ -116,10 +116,12 @@ where
     match *req.method() {
         Method::POST if path == "/api/upload" => upload(app, req).await,
         _ if get && path.starts_with("/api/meta/") => {
-            serve(app, &path["/api/meta/".len()..], PREVIEW_LEN).await
+            serve(app, &path["/api/meta/".len()..], PREVIEW_LEN, false).await
         }
         _ if get && path.starts_with("/api/download/") => {
-            serve(app, &path["/api/download/".len()..], MAX_BLOB).await
+            // A HEAD transfers nothing, so it claims nothing.
+            let claim = req.method() == Method::GET;
+            serve(app, &path["/api/download/".len()..], MAX_BLOB, claim).await
         }
         Method::DELETE if path.starts_with("/api/") => {
             let token = bearer(&req).map(str::to_owned);
@@ -223,17 +225,35 @@ impl Drop for TempFile {
 
 /// Sends the first min(limit, size) bytes of a blob, raw. The server never
 /// looks inside: the preview is a byte count, not the header (§3).
-async fn serve(app: Arc<App>, id: &str, limit: u64) -> Result<Response<Body>, ApiError> {
+///
+/// With `claim`, one of the file's downloads is claimed first, and the claim
+/// rides in the response body until the transfer ends.
+async fn serve(
+    app: Arc<App>,
+    id: &str,
+    limit: u64,
+    claim: bool,
+) -> Result<Response<Body>, ApiError> {
     let id = FileId::parse(id).ok_or(ApiError::NotFound)?;
     let size = blocking(&app, {
         let id = id.clone();
-        move |app| app.db().size(&id)
+        move |app| match claim {
+            true => app.db().claim(&id, (app.now)()),
+            false => Ok(app.db().size(&id, (app.now)())?),
+        }
     })
     .await
     .map_err(internal("could not read blob"))?
     .ok_or(ApiError::NotFound)?;
-    // An owner may delete the file while it streams. On POSIX that is
-    // harmless: the open descriptor keeps the bytes until it is closed.
+    // From here every way out, a refusal included, ends the claim.
+    let claim = claim.then(|| Claim {
+        app: app.clone(),
+        id: id.clone(),
+        completed: false,
+    });
+    // The owner or the sweeper may delete the file while it streams. On POSIX
+    // that is harmless, and deliberately not locked against: the open
+    // descriptor keeps the bytes until it is closed, and the transfer completes.
     let file = match tokio::fs::File::open(app.blob_path(&id)).await {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ApiError::NotFound), // deleted since the query
         file => file.map_err(internal("could not read blob"))?,
@@ -242,14 +262,53 @@ async fn serve(app: Arc<App>, id: &str, limit: u64) -> Result<Response<Body>, Ap
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, len)
-        .body(Blob { file, left: len }.boxed())
+        .body(
+            Blob {
+                file,
+                left: len,
+                claim,
+            }
+            .boxed(),
+        )
         .expect("valid response"))
+}
+
+/// A claimed download. Dropped, it ends: counted if `completed`, refunded if
+/// not. The database work runs off the async workers.
+struct Claim {
+    app: Arc<App>,
+    id: FileId,
+    completed: bool,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let (app, id, completed) = (self.app.clone(), self.id.clone(), self.completed);
+        let end = move || app.end_download(&id, completed);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(end)),
+            Err(_) => end(),
+        }
+    }
 }
 
 /// The first `left` bytes of a blob file, read as the connection takes them.
 struct Blob {
     file: tokio::fs::File,
     left: u64,
+    claim: Option<Claim>,
+}
+
+/// hyper drops the body when the response ends. If every byte was handed over,
+/// the download completed; if the client went away first, it did not. (Bytes
+/// handed to hyper may still be in its buffers when the connection dies; that
+/// last chunk's worth is the most a download can be miscounted by.)
+impl Drop for Blob {
+    fn drop(&mut self) {
+        if let Some(claim) = &mut self.claim {
+            claim.completed = self.left == 0;
+        }
+    }
 }
 
 impl HttpBody for Blob {
@@ -302,7 +361,7 @@ async fn delete(
     blocking(&app, move |app| {
         let owner = app
             .db()
-            .owner(&id)
+            .owner(&id, (app.now)())
             .map_err(internal("could not delete"))?
             .ok_or(ApiError::NotFound)?;
         if !owner.matches(&token) {
@@ -421,18 +480,20 @@ pub(crate) mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Once};
     use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use http_body_util::BodyExt;
     use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
     use hyper::{HeaderMap, Request, StatusCode};
+    use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
 
-    use super::CONTENT_SECURITY_POLICY;
+    use super::{Body, CONTENT_SECURITY_POLICY};
     use crate::app::{App, FileId, MAX_BLOB};
 
     // ---- helpers ------------------------------------------------------------
@@ -589,7 +650,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn upload(s: &Server, blob: &[u8]) -> Uploaded {
-        let r = send(s, "POST", &live_path(), Source::bytes(blob), "").await;
+        upload_with(s, &live_path(), blob).await
+    }
+
+    /// An upload to `path`, which carries its limits.
+    pub(crate) async fn upload_with(s: &Server, path: &str, blob: &[u8]) -> Uploaded {
+        let r = send(s, "POST", path, Source::bytes(blob), "").await;
         assert_eq!(
             r.status,
             StatusCode::CREATED,
@@ -623,6 +689,67 @@ pub(crate) mod tests {
 
     pub(crate) fn blob_exists(s: &Server, id: &str) -> bool {
         s.app.blob_path(&FileId::parse(id).unwrap()).exists()
+    }
+
+    /// A row's (downloads, in_flight, deleting), or None if it has none.
+    pub(crate) fn counts(s: &Server, id: &str) -> Option<(i64, i64, i64)> {
+        s.app
+            .db()
+            .conn()
+            .query_row(
+                "SELECT downloads, in_flight, deleting FROM blobs WHERE id = ?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Waits up to 5 seconds for `done`: a transfer's end is recorded off the
+    /// request, after its body is dropped.
+    pub(crate) async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    static LOGGED: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            LOGGED
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+        fn flush(&self) {}
+    }
+
+    /// Starts recording what is logged, from every test in the process.
+    pub(crate) fn capture_logs() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            log::set_logger(&Capture).unwrap();
+            log::set_max_level(log::LevelFilter::Info);
+        });
+    }
+
+    /// What has been logged that mentions `needle`.
+    pub(crate) fn logged(needle: &str) -> Vec<(log::Level, String)> {
+        LOGGED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message)| message.contains(needle))
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn user_version(db: &rusqlite::Connection) -> i64 {
@@ -1137,5 +1264,261 @@ pub(crate) mod tests {
             (n as i64, n, 0),
             "rows, blobs, tmp"
         );
+    }
+
+    // ---- expiry -------------------------------------------------------------
+
+    fn limits_path(expires_at: i64, max_downloads: u32) -> String {
+        format!("/api/upload?expires_at={expires_at}&max_downloads={max_downloads}")
+    }
+
+    /// A download request whose body is not read: its response, with the
+    /// transfer not yet started.
+    async fn start_download(s: &Server, id: &str) -> Body {
+        let req = Request::get(format!("/api/download/{id}"))
+            .body(Source::bytes(b""))
+            .unwrap();
+        let res = super::handle(s.app.clone(), req).await;
+        assert_eq!(res.status(), StatusCode::OK, "start download");
+        res.into_body()
+    }
+
+    /// Sixteen downloads of a 1-download file at once, round after round:
+    /// exactly one is served, and then the file is deleted. Checking in one
+    /// statement and claiming in another loses this within a few rounds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn last_download_race() {
+        const ROUNDS: usize = 100;
+        const RACERS: usize = 16;
+        let s = Arc::new(server());
+        for round in 0..ROUNDS {
+            let blob = random_blob(1000);
+            let u = upload_with(&s, &limits_path(now() + 3600, 1), &blob).await;
+            let path = format!("/api/download/{}", u.id);
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let (s, path) = (s.clone(), path.clone());
+                    tokio::spawn(async move { get(&s, &path).await })
+                })
+                .collect();
+            let mut served = 0;
+            for racer in racers {
+                let r = racer.await.unwrap();
+                match r.status {
+                    StatusCode::OK => {
+                        assert!(r.body == blob, "round {round}: served the wrong bytes");
+                        served += 1;
+                    }
+                    StatusCode::NOT_FOUND => {}
+                    other => panic!("round {round}: {other}"),
+                }
+            }
+            assert_eq!(
+                served, 1,
+                "round {round}: downloads served of a 1-download file"
+            );
+            wait_until("the used-up file is deleted", || {
+                counts(&s, &u.id).is_none()
+            })
+            .await;
+            assert!(
+                !blob_exists(&s, &u.id),
+                "round {round}: blob outlived its row"
+            );
+        }
+    }
+
+    /// A transfer that stops partway does not count: its claim is refunded and
+    /// the file can still be downloaded. And a file is not deleted when its last
+    /// download completes while another is in flight, since that one may fail.
+    #[tokio::test]
+    async fn aborted_download_is_refunded() {
+        let s = server();
+        let blob = random_blob(5 * 65536);
+        let u = upload_with(&s, &limits_path(now() + 3600, 1), &blob).await;
+        let download = format!("/api/download/{}", u.id);
+
+        let r = send(&s, "HEAD", &download, Source::bytes(b""), "").await;
+        assert_eq!(r.status, StatusCode::OK, "HEAD");
+        wait_until("nothing is in flight", || {
+            counts(&s, &u.id) == Some((0, 0, 0))
+        })
+        .await;
+
+        // The client goes away after one chunk: hyper drops the body.
+        let mut body = start_download(&s, &u.id).await;
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert!(first.len() < blob.len());
+        assert_eq!(counts(&s, &u.id), Some((1, 1, 0)), "claimed, in flight");
+        assert_eq!(
+            get(&s, &download).await.status,
+            StatusCode::NOT_FOUND,
+            "a second download while the only one is in flight"
+        );
+        drop(body);
+        wait_until("the aborted transfer ends", || {
+            counts(&s, &u.id) != Some((1, 1, 0))
+        })
+        .await;
+        assert_eq!(
+            counts(&s, &u.id),
+            Some((0, 0, 0)),
+            "after the abort: refunded"
+        );
+        assert!(
+            blob_exists(&s, &u.id),
+            "blob deleted by an aborted transfer"
+        );
+
+        let r = get(&s, &download).await;
+        assert!(
+            r.status == StatusCode::OK && r.body == blob,
+            "download after a refund: {}",
+            r.status
+        );
+        wait_until("the used-up file is deleted", || {
+            counts(&s, &u.id).is_none()
+        })
+        .await;
+        assert!(!blob_exists(&s, &u.id));
+
+        // Two downloads allowed, both in flight. One completes, which uses the
+        // file up; the other fails, which gives one back.
+        let u = upload_with(&s, &limits_path(now() + 3600, 2), &blob).await;
+        let download = format!("/api/download/{}", u.id);
+        let (mut a, b) = (
+            start_download(&s, &u.id).await,
+            start_download(&s, &u.id).await,
+        );
+        assert_eq!(
+            get(&s, &download).await.status,
+            StatusCode::NOT_FOUND,
+            "a third claim"
+        );
+        let mut got = Vec::new();
+        while let Some(frame) = a.frame().await {
+            got.extend_from_slice(&frame.unwrap().into_data().unwrap());
+        }
+        drop(a);
+        assert!(got == blob);
+        wait_until("the completed transfer ends", || {
+            counts(&s, &u.id) == Some((2, 1, 0))
+        })
+        .await;
+        assert!(
+            blob_exists(&s, &u.id),
+            "deleted while a download was in flight"
+        );
+        drop(b);
+        wait_until("the aborted transfer ends", || {
+            counts(&s, &u.id) == Some((1, 0, 0))
+        })
+        .await;
+        let r = get(&s, &download).await;
+        assert!(
+            r.status == StatusCode::OK && r.body == blob,
+            "the refunded download: {}",
+            r.status
+        );
+        wait_until("the used-up file is deleted", || {
+            counts(&s, &u.id).is_none()
+        })
+        .await;
+    }
+
+    /// max_downloads 0 is no download limit, not zero downloads.
+    #[tokio::test]
+    async fn no_download_limit() {
+        let s = server();
+        let blob = random_blob(1000);
+        let u = upload_with(&s, &limits_path(now() + 3600, 0), &blob).await;
+        for i in 0..50 {
+            let r = get(&s, &format!("/api/download/{}", u.id)).await;
+            assert!(
+                r.status == StatusCode::OK && r.body == blob,
+                "download {i}: {}",
+                r.status
+            );
+        }
+        wait_until("every transfer ends", || {
+            counts(&s, &u.id) == Some((50, 0, 0))
+        })
+        .await;
+        assert_eq!(s.app.sweep().unwrap(), (0, 0), "sweep");
+        assert_eq!(
+            get(&s, &format!("/api/meta/{}", u.id)).await.status,
+            StatusCode::OK,
+            "after 50 downloads and a sweep"
+        );
+    }
+
+    /// Expired, or with every download claimed, a file is answered exactly as an
+    /// ID never issued, on every endpoint, from the moment it is: before any
+    /// sweep has deleted it.
+    #[tokio::test]
+    async fn spent_files_are_not_found() {
+        const T0: i64 = 1_800_000_000;
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        let s = server_with(|app| app.now = || CLOCK.load(Ordering::Relaxed));
+        let blob = random_blob(1000);
+        let expiring = upload_with(&s, &limits_path(T0 + 3600, 0), &blob).await;
+        let used = upload_with(&s, &limits_path(T0 + 7200, 1), &blob).await;
+        CLOCK.store(T0 + 3599, Ordering::Relaxed);
+        assert_eq!(
+            get(&s, &format!("/api/meta/{}", expiring.id)).await.status,
+            StatusCode::OK,
+            "a second before expires_at"
+        );
+        CLOCK.store(T0 + 3600, Ordering::Relaxed);
+        // Its one download, claimed and not yet ended.
+        let in_flight = start_download(&s, &used.id).await;
+
+        let never = FileId::random().to_string();
+        let answer = |r: Reply| {
+            (
+                r.status,
+                r.body,
+                r.headers.get("content-type").cloned(),
+                r.headers.get("vary").cloned(),
+            )
+        };
+        for (method, prefix) in [
+            ("GET", "/api/meta/"),
+            ("HEAD", "/api/meta/"),
+            ("GET", "/api/download/"),
+            ("HEAD", "/api/download/"),
+            ("DELETE", "/api/"),
+        ] {
+            let want = answer(
+                send(
+                    &s,
+                    method,
+                    &format!("{prefix}{never}"),
+                    Source::bytes(b""),
+                    "x",
+                )
+                .await,
+            );
+            assert_eq!(want.0, StatusCode::NOT_FOUND);
+            for (what, u) in [("expired", &expiring), ("used up", &used)] {
+                let r = send(
+                    &s,
+                    method,
+                    &format!("{prefix}{}", u.id),
+                    Source::bytes(b""),
+                    &u.owner_token,
+                )
+                .await;
+                assert!(
+                    answer(r) == want,
+                    "{method} {prefix}: {what} is told apart from never issued"
+                );
+            }
+        }
+        assert!(
+            blob_exists(&s, &expiring.id) && counts(&s, &expiring.id).is_some(),
+            "the expired file was deleted without a sweep"
+        );
+        drop(in_flight);
     }
 }
