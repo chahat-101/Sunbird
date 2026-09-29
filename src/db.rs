@@ -252,18 +252,51 @@ impl Db {
     }
 
     /// Every file marked for deletion: those just marked, and those whose
-    /// deletion failed or was cut short by a crash.
-    pub fn marked(&self) -> Result<Vec<FileId>, Error> {
-        let ids: Vec<String> = self
+    /// deletion failed or was cut short by a crash. Each with whether it is
+    /// past its expiry time at `now`.
+    pub fn marked(&self, now: i64) -> Result<Vec<(FileId, bool)>, Error> {
+        let rows: Vec<(String, bool)> = self
             .0
-            .prepare("SELECT id FROM blobs WHERE deleting = 1")?
-            .query_map([], |r| r.get(0))?
+            .prepare("SELECT id, expires_at <= ? FROM blobs WHERE deleting = 1")?
+            .query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
-        ids.into_iter()
-            .map(|id| {
-                FileId::parse(&id).ok_or_else(|| format!("stored id {id:?} is malformed").into())
+        rows.into_iter()
+            .map(|(id, expired)| {
+                FileId::parse(&id)
+                    .map(|id| (id, expired))
+                    .ok_or_else(|| format!("stored id {id:?} is malformed").into())
             })
             .collect()
+    }
+
+    /// Deletes the upload ledger's entries that no quota can count any more:
+    /// exactly those `usage` leaves out of the 7 days at `now`, and at every
+    /// later time. Returns how many.
+    pub fn prune_ledger(&self, now: i64) -> rusqlite::Result<usize> {
+        self.0
+            .execute("DELETE FROM uploads WHERE created_at <= ?", [now - WEEK])
+    }
+
+    /// Every row of the counters table, as (name, value).
+    pub fn counters(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        self.0
+            .prepare("SELECT name, value FROM counters")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    /// Writes `rows` into the counters table, whole values, in one transaction.
+    pub fn save_counters(&mut self, rows: &[(&str, i64)]) -> Result<(), Error> {
+        self.write(|tx| {
+            let mut stmt = tx.prepare(
+                "INSERT INTO counters (name, value) VALUES (?, ?)
+                 ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            )?;
+            for (name, value) in rows {
+                stmt.execute(params![name, value])?;
+            }
+            Ok(())
+        })
     }
 
     /// Refunds every claim still in flight. Only at startup, when no transfer
@@ -1166,6 +1199,18 @@ mod tests {
                 "opening changed the ledger or the counters"
             );
         }
+        // Its counters are this version's counters, by name, and count on.
+        let v = s.app.counters.json();
+        assert_eq!(
+            (
+                v["uploads"].as_u64(),
+                v["bytes_uploaded"].as_u64(),
+                v["downloads"].as_u64(),
+                v["counting_since"].as_i64()
+            ),
+            (Some(6), Some(80_200), Some(2), Some(1_790_584_249)),
+            "counters read from the fixture: {v}"
+        );
         let fresh = TempDir::new();
         assert!(
             schema(open(&fresh.0).unwrap().db().conn()) == schema_before,

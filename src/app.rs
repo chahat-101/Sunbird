@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::config::{Admin, Config, Member, MemberId};
+use crate::counters::{Counter, Counters};
 use crate::db::{Db, Error, Usage};
 use crate::limit::Limiter;
 
@@ -199,6 +200,10 @@ pub struct App {
     pub upload_limit: Limiter<MemberId>,
     /// Previews and downloads, per client address (an IPv6 /64).
     pub read_limit: Limiter<IpAddr>,
+    pub counters: Counters,
+    /// Bytes free to an unprivileged process on the filesystem holding `dir`.
+    /// Tests replace it.
+    pub free_space: fn(&Path) -> std::io::Result<u64>,
 }
 
 fn system_clock() -> i64 {
@@ -206,6 +211,25 @@ fn system_clock() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("the clock is before 1970")
         .as_secs() as i64
+}
+
+/// statvfs's f_bavail: the blocks root's reserve does not count, since the
+/// server does not run as root.
+fn statvfs_free(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a NUL-terminated string that outlives the call, and
+    // `st` is written by statvfs before it is read, only when it returns 0.
+    let st = unsafe {
+        if libc::statvfs(path.as_ptr(), st.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        st.assume_init()
+    };
+    // Already u64 on 64-bit Linux; the conversions are for 32-bit targets.
+    #[allow(clippy::useless_conversion)]
+    Ok(u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize)))
 }
 
 impl App {
@@ -232,12 +256,17 @@ impl App {
                 "refunded downloads left in flight by the previous process, on {refunded} files"
             );
         }
+        // Loaded, not written: nothing is saved until the first timer or the
+        // shutdown, so opening a directory changes none of its rows.
+        let counters = Counters::load(&db.counters()?, system_clock());
         let app = App {
             dir: dir.to_owned(),
             db: Mutex::new(db),
             now: system_clock,
             upload_limit: Limiter::new(config.upload_rate),
             read_limit: Limiter::new(config.read_rate),
+            counters,
+            free_space: statvfs_free,
             config,
         };
         app.remove_orphans()?;
@@ -265,6 +294,20 @@ impl App {
     /// What a member has stored, and has uploaded in the last 7 days.
     pub fn usage(&self, member: &MemberId) -> Result<Usage, Error> {
         Ok(self.db().usage(member, (self.now)())?)
+    }
+
+    /// Whether `more` bytes can still be written and leave min_free_bytes
+    /// free. Checked before an upload's body with its declared length, and
+    /// again as it streams with what is left of it: parallel uploads each pass
+    /// the first check alone.
+    pub fn disk_has_room(&self, more: u64) -> std::io::Result<bool> {
+        let free = (self.free_space)(&self.dir.join("tmp"))?;
+        Ok(free >= self.config.min_free_bytes.saturating_add(more))
+    }
+
+    /// Writes the counters to the database.
+    pub fn save_counters(&self) -> Result<(), Error> {
+        self.db().save_counters(&self.counters.rows())
     }
 
     /// Gives a completed upload its ID, recorded as `uploader`'s, if their
@@ -341,6 +384,7 @@ impl App {
                     Err(e) => e.to_string(),
                     Ok(()) => "the unlink reported success".into(),
                 };
+                self.counters.add(Counter::DeletionFailures, 1);
                 log::error!(
                     "DELETION FAILED: file {id} is no longer served, but its blob is still on disk at {}: {why}",
                     path.display()
@@ -348,6 +392,7 @@ impl App {
                 Err(format!("file {id}: blob still on disk").into())
             }
             Err(e) => {
+                self.counters.add(Counter::DeletionFailures, 1);
                 log::error!(
                     "DELETION FAILED: file {id} is no longer served, but whether its blob at {} is gone cannot be checked: {e}",
                     path.display()
@@ -397,6 +442,13 @@ impl App {
     /// Ends a download claimed with `Db::claim`, counted if `completed` and
     /// refunded if not, and purges the file if that used it up.
     pub fn end_download(&self, id: &FileId, completed: bool) {
+        self.counters.add(
+            match completed {
+                true => Counter::Downloads,
+                false => Counter::FailedDownloads,
+            },
+            1,
+        );
         // Bound first: a guard in the match would be held into `purge`, which
         // locks the database again, and deadlock.
         let ended = self.db().end_download(id, completed);
@@ -414,13 +466,25 @@ impl App {
     /// Deletes every file past its limits, and retries every earlier deletion
     /// that failed. Marks first, so the files stop being served, then purges.
     /// Returns how many were deleted and how many could not be.
+    ///
+    /// Also prunes the upload ledger of entries past the 7 days, which no
+    /// quota can count again.
     pub fn sweep(&self) -> Result<(usize, usize), Error> {
+        let now = (self.now)();
         let marked = {
             let db = self.db();
-            db.mark_spent((self.now)())?;
-            db.marked()?
+            db.mark_spent(now)?;
+            db.prune_ledger(now)?;
+            db.marked(now)?
         };
-        let failed = marked.iter().filter(|id| self.purge(id).is_err()).count();
+        let mut failed = 0;
+        for (id, expired) in &marked {
+            match self.purge(id) {
+                Ok(()) if *expired => self.counters.add(Counter::ExpiredSwept, 1),
+                Ok(()) => {}
+                Err(_) => failed += 1,
+            }
+        }
         Ok((marked.len() - failed, failed))
     }
 
@@ -438,10 +502,13 @@ impl App {
             }
             match fs::remove_file(entry.path()) {
                 Ok(()) => log::info!("removed {}, a blob with no row", entry.path().display()),
-                Err(e) => log::error!(
-                    "DELETION FAILED: {}, a blob with no row: {e}",
-                    entry.path().display()
-                ),
+                Err(e) => {
+                    self.counters.add(Counter::DeletionFailures, 1);
+                    log::error!(
+                        "DELETION FAILED: {}, a blob with no row: {e}",
+                        entry.path().display()
+                    )
+                }
             }
         }
         Ok(())

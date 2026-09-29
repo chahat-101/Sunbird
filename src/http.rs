@@ -16,6 +16,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 use crate::app::{App, FileId, Limits, MAX_BLOB, OwnerToken, PREVIEW_LEN};
+use crate::counters::Counter;
 use crate::limit;
 
 pub type Body = BoxBody<Bytes, io::Error>;
@@ -41,6 +42,8 @@ pub enum ApiError {
     TooLarge,
     /// The member's quota, with the message naming the limit and when it frees.
     OverQuota(String),
+    /// Free space is at the floor, min_free_bytes.
+    LowDisk,
     /// The cause is logged where it happened; the client gets only this.
     Internal(&'static str),
 }
@@ -56,6 +59,7 @@ impl ApiError {
             ApiError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::BadLimits(_) | ApiError::Incomplete => StatusCode::BAD_REQUEST,
             ApiError::TooLarge | ApiError::OverQuota(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::LowDisk => StatusCode::INSUFFICIENT_STORAGE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -72,6 +76,7 @@ impl ApiError {
             ApiError::BadLimits(why) | ApiError::Internal(why) => why,
             ApiError::Incomplete => "upload did not complete",
             ApiError::TooLarge => "upload is larger than the server accepts",
+            ApiError::LowDisk => "the server is low on disk space; nothing was stored",
         }
     }
 
@@ -150,7 +155,10 @@ where
             );
             app.read_limit
                 .check(limit::bucket(client))
-                .map_err(ApiError::RateLimited)?;
+                .map_err(|wait| {
+                    app.counters.add(Counter::RateLimitedReads, 1);
+                    ApiError::RateLimited(wait)
+                })?;
             match path.strip_prefix("/api/meta/") {
                 Some(id) => serve(app, id, PREVIEW_LEN, false).await,
                 None => {
@@ -160,6 +168,7 @@ where
                 }
             }
         }
+        _ if get && path == "/admin/stats" => stats(&app, bearer(&req)),
         Method::DELETE if path.starts_with("/api/admin/") => {
             let token = bearer(&req).map(str::to_owned);
             admin_delete(app, &path["/api/admin/".len()..], token).await
@@ -194,10 +203,11 @@ async fn blocking<T: Send + 'static>(
 
 /// Every refusal that can come before the body does: no member's token (401),
 /// the member's rate (429), the limits (400), then a declared length over
-/// max_blob or over the member's quota (413). Then the body streams to tmp/
-/// and is cut off at the smaller of max_blob and the member's room; nothing is
-/// buffered to find its length. The quota is checked a third time, and
-/// decisively, when the file is saved.
+/// max_blob or over the member's quota (413), then one that would take the
+/// disk below min_free_bytes (507). Then the body streams to tmp/ and is cut
+/// off at the smaller of max_blob and the member's room, or when free space
+/// reaches the floor; nothing is buffered to find its length. The quota is
+/// checked a third time, and decisively, when the file is saved.
 async fn upload<B>(app: Arc<App>, req: Request<B>) -> Result<Response<Body>, ApiError>
 where
     B: HttpBody<Data = Bytes> + Unpin,
@@ -207,11 +217,53 @@ where
         .and_then(|token| app.config.member(token))
         .cloned()
         .ok_or(ApiError::NotAMember)?;
-    app.upload_limit
-        .check(member.id.clone())
-        .map_err(ApiError::RateLimited)?;
+    app.upload_limit.check(member.id.clone()).map_err(|wait| {
+        app.counters.add(Counter::RateLimitedUploads, 1);
+        ApiError::RateLimited(wait)
+    })?;
     let limits = Limits::parse(req.uri().query(), (app.now)()).map_err(ApiError::BadLimits)?;
-    let mut body = req.into_body();
+
+    // From here an upload that stores nothing, other than by a refusal, is a
+    // failed upload. Counted when this is dropped, so an upload cut off at
+    // shutdown, whose future is dropped mid-await, counts too.
+    let mut failed = FailedUpload(Some(app.clone()));
+    let stored = receive(&app, req.into_body(), member, limits).await;
+    match &stored {
+        Ok(_) | Err(ApiError::TooLarge | ApiError::OverQuota(_)) => failed.0 = None,
+        Err(ApiError::LowDisk) => {
+            failed.0 = None;
+            app.counters.add(Counter::UploadsRefusedLowDisk, 1);
+        }
+        Err(_) => {}
+    }
+    stored
+}
+
+/// Counts a failed upload when dropped, unless disarmed.
+struct FailedUpload(Option<Arc<App>>);
+
+impl Drop for FailedUpload {
+    fn drop(&mut self) {
+        if let Some(app) = &self.0 {
+            app.counters.add(Counter::FailedUploads, 1);
+        }
+    }
+}
+
+/// Free space is checked at least this often while a body streams.
+const DISK_CHECK_EVERY: u64 = 1 << 20;
+
+/// The body of an upload that has passed the checks on its headers.
+async fn receive<B>(
+    app: &Arc<App>,
+    mut body: B,
+    member: crate::config::Member,
+    limits: Limits,
+) -> Result<Response<Body>, ApiError>
+where
+    B: HttpBody<Data = Bytes> + Unpin,
+    B::Error: Display,
+{
     // hyper's size hint is the declared Content-Length, exactly; 0 if none.
     let declared = body.size_hint().lower();
     if declared > MAX_BLOB {
@@ -219,7 +271,7 @@ where
     }
     // The first check: the declared length, or with none, whether even an
     // empty file fits (a member at their file limit is refused here).
-    let usage = blocking(&app, {
+    let usage = blocking(app, {
         let id = member.id.clone();
         move |app| app.usage(&id)
     })
@@ -231,12 +283,16 @@ where
         .admit(&usage, declared, now)
         .map_err(ApiError::OverQuota)?;
     let room = member.quota.room(&usage);
+    // The disk floor, before a byte of the body: the declared length must fit
+    // above it.
+    disk_room(app, declared).await?;
 
     let tmp = TempFile(app.temp_path());
     let mut file = tokio::fs::File::create_new(&tmp.0)
         .await
         .map_err(internal("could not store upload"))?;
     let mut size = 0u64;
+    let mut unchecked = 0u64;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| {
             log::warn!("upload: aborted after {size} bytes: {e}");
@@ -256,6 +312,16 @@ where
                 Ok(()) => ApiError::TooLarge,
             });
         }
+        // The floor again, before any MiB is written unchecked: other uploads
+        // share the disk, and a full one fails this one at 90% with a
+        // partial blob. What is left of the declared length must fit too,
+        // and at least this chunk.
+        if unchecked + data.len() as u64 > DISK_CHECK_EVERY {
+            let written = size - data.len() as u64;
+            disk_room(app, declared.saturating_sub(written).max(data.len() as u64)).await?;
+            unchecked = 0;
+        }
+        unchecked += data.len() as u64;
         file.write_all(&data)
             .await
             .map_err(internal("could not store upload"))?;
@@ -271,16 +337,30 @@ where
     let token = OwnerToken::random();
     let owner = token.hash();
     // tmp moves in, so its name is removed only once the link has been made.
-    let id = blocking(&app, move |app| {
+    let id = blocking(app, move |app| {
         app.commit(&tmp.0, &owner, size, limits, &member)
     })
     .await
     .map_err(internal("could not store upload"))?
     .map_err(ApiError::OverQuota)?;
+    app.counters.add(Counter::Uploads, 1);
+    app.counters.add(Counter::BytesUploaded, size);
     Ok(json(
         StatusCode::CREATED,
         &serde_json::json!({ "id": id.to_string(), "ownerToken": token.as_str() }),
     ))
+}
+
+/// Refuses with 507 unless `more` bytes fit above the free-space floor.
+async fn disk_room(app: &Arc<App>, more: u64) -> Result<(), ApiError> {
+    let fits = blocking(app, move |app| app.disk_has_room(more))
+        .await
+        .map_err(internal("could not check free disk space"))?;
+    if !fits {
+        log::warn!("upload refused: free disk space is below min_free_bytes");
+        return Err(ApiError::LowDisk);
+    }
+    Ok(())
 }
 
 /// An upload's file in tmp/, removed on every path: on success its blob has
@@ -377,8 +457,10 @@ struct Blob {
 
 /// hyper drops the body when the response ends. If every byte was handed over,
 /// the download completed; if the client went away first, it did not. (Bytes
-/// handed to hyper may still be in its buffers when the connection dies; that
-/// last chunk's worth is the most a download can be miscounted by.)
+/// handed to hyper may still be in its buffers when the connection dies: to a
+/// client that stopped reading, it queues up to about 400 KiB before it must
+/// write. Past hyper are the socket, and any proxy, which hold more. So
+/// completed means sent, never received: see the README, Counters.)
 impl Drop for Blob {
     fn drop(&mut self) {
         if let Some(claim) = &mut self.claim {
@@ -487,6 +569,17 @@ async fn admin_delete(
         .status(StatusCode::NO_CONTENT)
         .body(empty())
         .expect("valid response"))
+}
+
+// ---- stats ------------------------------------------------------------------
+
+/// `GET /admin/stats` with an admin token: the counters, totals only. Nothing
+/// here names a file or a member.
+fn stats(app: &App, token: Option<&str>) -> Result<Response<Body>, ApiError> {
+    token
+        .and_then(|token| app.config.admin(token))
+        .ok_or(ApiError::NotAnAdmin)?;
+    Ok(json(StatusCode::OK, &app.counters.json()))
 }
 
 // ---- client -----------------------------------------------------------------
@@ -652,6 +745,7 @@ pub(crate) mod tests {
             "trusted_proxies": [],
             "upload_rate": { "requests": u32::MAX, "seconds": 1 },
             "read_rate": { "requests": u32::MAX, "seconds": 1 },
+            "min_free_bytes": 0,
         });
         edit(&mut c);
         Config::parse(c.to_string().as_bytes()).unwrap()
@@ -682,9 +776,11 @@ pub(crate) mod tests {
         server_config(test_config(), setup)
     }
 
+    /// A disk with more free than any test uses, unless a test sets its own.
     pub(crate) fn server_config(config: Config, setup: impl FnOnce(&mut App)) -> Server {
         let dir = TempDir::new();
         let mut app = App::open(&dir.0, config).unwrap();
+        app.free_space = |_| Ok(LOTS);
         setup(&mut app);
         Server {
             app: Arc::new(app),
@@ -2456,5 +2552,546 @@ pub(crate) mod tests {
             }),
             |_| {},
         )
+    }
+
+    // ---- counters and the disk floor ------------------------------------------
+
+    /// GET /admin/stats with the admin token, as JSON.
+    async fn stats(s: &Server) -> serde_json::Value {
+        let r = send(s, "GET", "/admin/stats", Source::bytes(b""), ADMIN_TOKEN).await;
+        assert_eq!(r.status, StatusCode::OK, "stats");
+        r.json()
+    }
+
+    const COUNTER_NAMES: [&str; 11] = [
+        "uploads",
+        "bytes_uploaded",
+        "downloads",
+        "failed_downloads",
+        "failed_uploads",
+        "expired_swept",
+        "deletion_failures",
+        "rate_limited_uploads",
+        "rate_limited_reads",
+        "uploads_refused_low_disk",
+        "counting_since",
+    ];
+
+    /// Only an admin's token opens the stats: none, a wrong one, a member's, and
+    /// the admin token's hash are 401. What it returns is totals and nothing
+    /// else: exactly the counters, each a number, and no file id, owner token,
+    /// member id or name anywhere in it.
+    #[tokio::test]
+    async fn admin_stats_are_totals_behind_admin_auth() {
+        let s = server();
+        let u = upload(&s, &random_blob(1000)).await;
+        assert_eq!(
+            get(&s, &format!("/api/download/{}", u.id)).await.status,
+            StatusCode::OK
+        );
+        let hash = hex(&token_sha256(ADMIN_TOKEN));
+        for (why, token) in [
+            ("no token", ""),
+            ("a wrong token", "not-a-token"),
+            ("a member's token", MEMBER_TOKEN),
+            ("the admin token's hash", hash.as_str()),
+        ] {
+            for method in ["GET", "HEAD"] {
+                let r = send(&s, method, "/admin/stats", Source::bytes(b""), token).await;
+                assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{method}, {why}");
+            }
+        }
+
+        let r = send(&s, "GET", "/admin/stats", Source::bytes(b""), ADMIN_TOKEN).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.headers["cache-control"], "no-store");
+        let v = r.json();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut want = COUNTER_NAMES.to_vec();
+        keys.sort();
+        want.sort();
+        assert_eq!(keys, want, "stats keys");
+        assert!(
+            v.as_object().unwrap().values().all(|n| n.is_u64()),
+            "a stat that is not a whole number: {v}"
+        );
+        let text = String::from_utf8(r.body).unwrap();
+        for secret in [
+            u.id.as_str(),
+            u.owner_token.as_str(),
+            MEMBER_ID,
+            "member",
+            ADMIN_ID,
+        ] {
+            assert!(!text.contains(secret), "stats contain {secret:?}: {text}");
+        }
+        assert_eq!(
+            (v["uploads"].as_u64(), v["downloads"].as_u64()),
+            (Some(1), Some(1))
+        );
+    }
+
+    /// A disk that fills as files are written to it: free space is CAPACITY less
+    /// what is in blobs/ and tmp/.
+    static CAPACITY: AtomicU64 = AtomicU64::new(0);
+
+    fn filling_disk(tmp: &Path) -> std::io::Result<u64> {
+        let data = tmp.parent().unwrap();
+        let mut used = 0;
+        for sub in ["blobs", "tmp"] {
+            for entry in fs::read_dir(data.join(sub))? {
+                used += entry?.metadata()?.len();
+            }
+        }
+        Ok(CAPACITY.load(Ordering::Relaxed).saturating_sub(used))
+    }
+
+    const FLOOR: u64 = 10 << 20;
+    const MIB: u64 = 1 << 20;
+
+    /// With a Content-Length, the floor is exact: an upload that would leave
+    /// exactly min_free_bytes free is stored, and one byte more is refused
+    /// with 507 before a byte of the body is read. Without one, the stream is
+    /// cut off once free space reaches the floor, within a MiB of it, and the
+    /// partial file is removed. Every refusal is counted.
+    #[tokio::test]
+    async fn disk_floor() {
+        let s = server_config(
+            config(vec![member(MEMBER_ID, "m", MEMBER_TOKEN, NO_LIMIT)], |c| {
+                c["min_free_bytes"] = FLOOR.into()
+            }),
+            |app| app.free_space = filling_disk,
+        );
+        let n = 3 * MIB + 5;
+
+        // One byte short of room for it, declared: refused unread.
+        CAPACITY.store(FLOOR + n - 1, Ordering::Relaxed);
+        let body = Source::zeros(Some(n), Some(n));
+        let read = body.counter();
+        let r = send(&s, "POST", &live_path(), body, MEMBER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "one byte short");
+        assert_eq!(
+            error_of(&r),
+            "the server is low on disk space; nothing was stored"
+        );
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            0,
+            "bytes read of a refused body"
+        );
+        assert_eq!(
+            (entries(&s, "tmp"), entries(&s, "blobs"), rows(&s)),
+            (0, 0, 0)
+        );
+
+        // Exactly room for it: stored, and the disk is at the floor.
+        CAPACITY.store(FLOOR + n, Ordering::Relaxed);
+        let r = send(
+            &s,
+            "POST",
+            &live_path(),
+            Source::zeros(Some(n), Some(n)),
+            MEMBER_TOKEN,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "exactly room");
+        assert_eq!(filling_disk(&s.dir.0.join("tmp")).unwrap(), FLOOR);
+
+        // At the floor, an empty file still fits; a byte below it, nothing does.
+        let r = send(&s, "POST", &live_path(), Source::bytes(b""), MEMBER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::CREATED, "an empty file at the floor");
+        CAPACITY.store(FLOOR + n - 1, Ordering::Relaxed);
+        let r = send(&s, "POST", &live_path(), Source::bytes(b""), MEMBER_TOKEN).await;
+        assert_eq!(
+            r.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "below the floor"
+        );
+
+        // No declared length, and 3 MiB of room for a body of 8: the stream is
+        // cut off once free space reaches the floor. It is checked at least
+        // every MiB, so at most a MiB and a chunk past the room are read.
+        CAPACITY.store(FLOOR + n + 3 * MIB, Ordering::Relaxed);
+        let body = Source::zeros(Some(8 * MIB), None);
+        let read = body.counter();
+        let r = send(&s, "POST", &live_path(), body, MEMBER_TOKEN).await;
+        assert_eq!(
+            r.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "streamed past the floor"
+        );
+        let read = read.load(Ordering::Relaxed);
+        assert!(
+            read <= 4 * MIB + 64 * 1024,
+            "read {read} bytes with 3 MiB of room"
+        );
+        assert_eq!(
+            (entries(&s, "tmp"), entries(&s, "blobs"), rows(&s)),
+            (0, 2, 2),
+            "the partial file was left behind"
+        );
+
+        // A declared length is checked again as it streams, against what is
+        // left of it: a body that lies about its length gets no further.
+        CAPACITY.store(FLOOR + n + 3 * MIB, Ordering::Relaxed);
+        let body = Source::zeros(Some(8 * MIB), Some(MIB));
+        let r = send(&s, "POST", &live_path(), body, MEMBER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "a false length");
+        assert_eq!(entries(&s, "tmp"), 0);
+
+        // Exactly room for a declared 4 MiB, and then another upload takes
+        // 2 MiB of it while this one streams. Each check counts what is left
+        // of the declared length, so the first one refuses it, a MiB in, not
+        // the one that finds the disk at the floor.
+        CAPACITY.store(FLOOR + n + 4 * MIB, Ordering::Relaxed);
+        let body = Taken {
+            left: 4 * MIB,
+            taken: false,
+            read: Default::default(),
+        };
+        let read = body.read.clone();
+        let req = Request::post(live_path())
+            .header("Authorization", format!("Bearer {MEMBER_TOKEN}"))
+            .body(body)
+            .unwrap();
+        let r = super::handle(s.app.clone(), PEER.parse().unwrap(), req).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::INSUFFICIENT_STORAGE,
+            "room taken mid-stream"
+        );
+        let read = read.load(Ordering::Relaxed);
+        assert!(read <= MIB + 64 * 1024, "read {read} bytes before refusing");
+        assert_eq!(entries(&s, "tmp"), 0);
+
+        let v = stats(&s).await;
+        assert_eq!(
+            (
+                v["uploads_refused_low_disk"].as_u64(),
+                v["failed_uploads"].as_u64()
+            ),
+            (Some(5), Some(0)),
+            "refused at the floor, failed"
+        );
+    }
+
+    /// `left` bytes of zeros, declared, in 64 KiB chunks; after the first, 2 MiB
+    /// of the disk is taken by someone else.
+    struct Taken {
+        left: u64,
+        taken: bool,
+        read: Arc<AtomicU64>,
+    }
+
+    impl HttpBody for Taken {
+        type Data = Bytes;
+        type Error = &'static str;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if !this.taken && this.read.load(Ordering::Relaxed) > 0 {
+                this.taken = true;
+                CAPACITY.fetch_sub(2 * MIB, Ordering::Relaxed);
+            }
+            let n = this.left.min(64 * 1024);
+            if n == 0 {
+                return Poll::Ready(None);
+            }
+            this.left -= n;
+            this.read.fetch_add(n, Ordering::Relaxed);
+            Poll::Ready(Some(Ok(Frame::data(vec![0; n as usize].into()))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(4 * MIB)
+        }
+    }
+
+    /// A body that sends one chunk and then nothing, ever.
+    struct Stall(bool);
+
+    impl HttpBody for Stall {
+        type Data = Bytes;
+        type Error = &'static str;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let sent = std::mem::replace(&mut self.get_mut().0, true);
+            match sent {
+                false => Poll::Ready(Some(Ok(Frame::data(vec![0; 1000].into())))),
+                true => Poll::Pending,
+            }
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(2000)
+        }
+    }
+
+    /// Every counter, driven by the thing it counts, failures forced: an upload
+    /// whose client goes away, one cut off mid-body as shutdown does, a
+    /// download dropped partway, and a deletion the filesystem refuses, twice.
+    /// Refusals (401, 413) are not failures and count nowhere.
+    #[tokio::test]
+    async fn counters_count() {
+        use std::os::unix::fs::PermissionsExt;
+        const T0: i64 = 1_800_000_000;
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        let s = server_config(
+            config(
+                vec![member(MEMBER_ID, "m", MEMBER_TOKEN, [LOTS, LOTS, 210_000])],
+                |c| {
+                    c["upload_rate"] = serde_json::json!({ "requests": 7, "seconds": 3600 });
+                    c["read_rate"] = serde_json::json!({ "requests": 4, "seconds": 3600 });
+                },
+            ),
+            |app| app.now = || CLOCK.load(Ordering::Relaxed),
+        );
+        let path = |max_downloads: u32| limits_path(T0 + 60, max_downloads);
+
+        // Two stored, 202,000 bytes: a is several chunks long, so a download
+        // of it can stop partway.
+        let a = upload_with(&s, &path(0), &random_blob(200_000)).await;
+        let b = upload_with(&s, &path(1), &random_blob(2000)).await;
+        // And one that expires later: deleted by the sweeper, but not expired.
+        let c = upload_with(&s, &limits_path(T0 + 3600, 0), &[7; 10]).await;
+        // Refusals: no token, and over the weekly quota. Neither fails.
+        let refused = [
+            send(&s, "POST", &path(0), Source::bytes(b"x"), "").await,
+            send(
+                &s,
+                "POST",
+                &path(0),
+                Source::bytes(&random_blob(9000)),
+                MEMBER_TOKEN,
+            )
+            .await,
+        ];
+        assert_eq!(
+            refused.map(|r| r.status),
+            [StatusCode::UNAUTHORIZED, StatusCode::PAYLOAD_TOO_LARGE]
+        );
+        // The client goes away mid-body.
+        let gone = Source {
+            fails: true,
+            ..Source::zeros(Some(100), Some(1000))
+        };
+        let r = send(&s, "POST", &path(0), gone, MEMBER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        // Cut off mid-body, the request dropped unanswered: what shutdown
+        // does to an upload still going at the end of the grace period.
+        let req = Request::post(path(0))
+            .header("Authorization", format!("Bearer {MEMBER_TOKEN}"))
+            .body(Stall(false))
+            .unwrap();
+        let cut = tokio::time::timeout(
+            Duration::from_millis(200),
+            super::handle(s.app.clone(), PEER.parse().unwrap(), req),
+        )
+        .await;
+        assert!(cut.is_err(), "the stalled upload finished");
+        assert_eq!(entries(&s, "tmp"), 0, "the cut-off upload's partial file");
+        // Seventh upload allowed by the rate; the eighth is refused.
+        upload_with(&s, &path(0), b"").await;
+        let r = send(&s, "POST", &path(0), Source::bytes(b""), MEMBER_TOKEN).await;
+        assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+
+        // One download completes and uses b up; one is dropped partway.
+        let r = get(&s, &format!("/api/download/{}", b.id)).await;
+        assert_eq!(r.status, StatusCode::OK);
+        let mut partial = start_download(&s, &a.id).await;
+        partial.frame().await.unwrap().unwrap();
+        drop(partial);
+        wait_until("both transfers end", || {
+            counts(&s, &a.id) == Some((0, 0, 0)) && counts(&s, &b.id).is_none()
+        })
+        .await;
+        // Two more reads use up the read rate of 4; the fifth is refused.
+        for want in [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert_eq!(get(&s, &format!("/api/meta/{}", a.id)).await.status, want);
+        }
+
+        // c's owner deletes it and the filesystem refuses: a failure, and c
+        // stays marked for the sweeper. Then a and the empty file expire. The
+        // first sweep cannot delete any of the three, and neither can the
+        // second: a failure per file per attempt. The third deletes them all,
+        // two of them expired.
+        let blobs = s.dir.0.join("blobs");
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o500)).unwrap();
+        let r = send(
+            &s,
+            "DELETE",
+            &format!("/api/{}", c.id),
+            Source::bytes(b""),
+            &c.owner_token,
+        )
+        .await;
+        CLOCK.store(T0 + 60, Ordering::Relaxed);
+        let sweeps = [s.app.sweep(), s.app.sweep()];
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            r.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the refused delete"
+        );
+        assert_eq!(sweeps.map(|r| r.unwrap()), [(0, 3), (0, 3)]);
+        assert_eq!(s.app.sweep().unwrap(), (3, 0), "the third sweep");
+
+        let v = stats(&s).await;
+        let got: Vec<(&str, u64)> = COUNTER_NAMES[..10]
+            .iter()
+            .map(|&k| (k, v[k].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("uploads", 4),
+                ("bytes_uploaded", 202_010),
+                ("downloads", 1),
+                ("failed_downloads", 1),
+                ("failed_uploads", 2),
+                ("expired_swept", 2),
+                ("deletion_failures", 7),
+                ("rate_limited_uploads", 1),
+                ("rate_limited_reads", 1),
+                ("uploads_refused_low_disk", 0),
+            ]
+        );
+    }
+
+    /// The counters, saved and the directory opened again, carry on where they
+    /// were, counting_since included. Opening alone writes nothing.
+    #[tokio::test]
+    async fn counters_survive_a_restart() {
+        let s = server();
+        let u = upload(&s, &random_blob(1234)).await;
+        assert_eq!(
+            get(&s, &format!("/api/download/{}", u.id)).await.status,
+            StatusCode::OK
+        );
+        wait_until("the download ends", || {
+            s.app.counters.get(crate::counters::Counter::Downloads) == 1
+        })
+        .await;
+        let before = stats(&s).await;
+        let saved = |s: &Server| -> i64 {
+            s.app
+                .db()
+                .conn()
+                .query_row("SELECT COUNT(*) FROM counters", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(saved(&s), 0, "opening wrote counters");
+        s.app.save_counters().unwrap();
+
+        let s = restart(s, test_config(), |app| {
+            app.free_space = |_| Ok(LOTS);
+            app.now = || now() + 3600;
+        });
+        let after = stats(&s).await;
+        assert_eq!(after, before, "counters after a restart");
+        assert_eq!(
+            (after["uploads"].as_u64(), after["bytes_uploaded"].as_u64()),
+            (Some(1), Some(1234))
+        );
+        upload(&s, b"more").await;
+        assert_eq!(stats(&s).await["uploads"].as_u64(), Some(2), "counting on");
+    }
+
+    /// Pruning the ledger changes no quota answer, at the time it prunes or at
+    /// any later one. Two databases hold the same ledger, entries on either side
+    /// of every 7-day boundary the clock crosses; one is pruned at each step,
+    /// the other never. Their usage, and admit's answer for sizes on either side
+    /// of the weekly limit, agree throughout, and the pruned one does lose rows.
+    #[test]
+    fn ledger_pruning_changes_no_quota_result() {
+        use crate::db::Db;
+        const T0: i64 = 1_800_000_000;
+        let dirs = [TempDir::new(), TempDir::new()];
+        let [mut kept, mut pruned] =
+            [0, 1].map(|i| Db::open(&dirs[i].0.join("sunbird.db")).unwrap());
+        let c = config(
+            vec![member(MEMBER_ID, "m", MEMBER_TOKEN, [LOTS, LOTS, 10_000])],
+            |_| {},
+        );
+        let m = &c.members[0];
+        let mut times = vec![];
+        for (i, at) in [
+            -2 * WEEK,
+            -WEEK - 1,
+            -WEEK,
+            -WEEK + 1,
+            -1,
+            0,
+            1,
+            3600,
+            WEEK - 1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = T0 + at;
+            for db in [&mut kept, &mut pruned] {
+                db.write(|tx| {
+                    tx.execute(
+                        "INSERT INTO uploads (uploader_id, size, created_at) VALUES (?, ?, ?)",
+                        rusqlite::params![MEMBER_ID, 1000 + i as i64, at],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            times.extend([at - 1, at, at + 1, at + WEEK - 1, at + WEEK, at + WEEK + 1]);
+        }
+        times.sort();
+        times.dedup();
+        let mut removed = 0;
+        for t in times {
+            removed += pruned.prune_ledger(t).unwrap();
+            let (a, b) = (
+                kept.usage(&m.id, t).unwrap(),
+                pruned.usage(&m.id, t).unwrap(),
+            );
+            assert_eq!(a.week, b.week, "at {}: the week's uploads", t - T0);
+            let week: u64 = a.week.iter().map(|&(size, _)| size).sum();
+            for size in [
+                0,
+                1,
+                10_000u64.saturating_sub(week),
+                10_001u64.saturating_sub(week),
+            ] {
+                assert_eq!(
+                    m.quota.admit(&a, size, t),
+                    m.quota.admit(&b, size, t),
+                    "at {}: admit {size}",
+                    t - T0
+                );
+            }
+        }
+        assert_eq!(removed, 9, "entries pruned");
+    }
+
+    /// The sweeper prunes the ledger as it runs.
+    #[tokio::test]
+    async fn sweep_prunes_the_ledger() {
+        const T0: i64 = 1_800_000_000;
+        static CLOCK: AtomicI64 = AtomicI64::new(T0);
+        let s = server_with(|app| app.now = || CLOCK.load(Ordering::Relaxed));
+        upload_with(&s, &limits_path(T0 + 60, 0), b"x").await;
+        CLOCK.store(T0 + WEEK - 1, Ordering::Relaxed);
+        s.app.sweep().unwrap();
+        assert_eq!(ledger(&s), 1, "pruned inside the 7 days");
+        CLOCK.store(T0 + WEEK, Ordering::Relaxed);
+        s.app.sweep().unwrap();
+        assert_eq!(ledger(&s), 0, "kept past the 7 days");
     }
 }

@@ -111,6 +111,9 @@ pub struct Config {
     pub upload_rate: Rate,
     /// Preview and download, per client address.
     pub read_rate: Rate,
+    /// Free space on the data directory's filesystem below which uploads are
+    /// refused. Quotas bound each member, not the disk: this bounds the disk.
+    pub min_free_bytes: u64,
 }
 
 /// The entry in `entries` whose token hashes to `token`'s hash. Every entry is
@@ -174,9 +177,6 @@ impl Config {
         )?;
         if let Some(note) = top.get("note") {
             note.as_str().ok_or("note: a string, if given")?;
-        }
-        if top.contains_key("min_free_bytes") {
-            log::warn!("min_free_bytes: not read; the disk floor arrives in session 04");
         }
 
         let mut members = Vec::new();
@@ -262,6 +262,7 @@ impl Config {
             trusted_proxies,
             upload_rate: rate(top, "upload_rate")?,
             read_rate: rate(top, "read_rate")?,
+            min_free_bytes: whole(top, "min_free_bytes", "the config")?,
         })
     }
 }
@@ -478,6 +479,7 @@ pub(crate) mod tests {
             "members": members, "admins": [], "trusted_proxies": [],
             "upload_rate": { "requests": 1, "seconds": 1 },
             "read_rate": { "requests": 1, "seconds": 1 },
+            "min_free_bytes": 1,
         })
     }
 
@@ -488,7 +490,7 @@ pub(crate) mod tests {
     /// The example in the repository parses: it cannot drift from the parser.
     #[test]
     fn example_config_parses() {
-        let c = Config::read(Path::new("sunbird.example.json")).unwrap();
+        let c = Config::read(Path::new("deploy/sunbird.example.json")).unwrap();
         assert!(!c.members.is_empty() && !c.admins.is_empty());
     }
 
@@ -505,6 +507,7 @@ pub(crate) mod tests {
         for key in [
             "upload_rate",
             "read_rate",
+            "min_free_bytes",
             "members",
             "admins",
             "trusted_proxies",

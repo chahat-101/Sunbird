@@ -1,0 +1,22 @@
+# Caddy in front of Sunbird: TLS here, everything else to the server on
+# 127.0.0.1:8080, which is not reachable from outside. Replace the host name
+# with yours; Caddy obtains and renews the certificate, and redirects plain
+# HTTP to HTTPS.
+#
+# TLS is not optional. The fragment of a link never reaches the server, but
+# the JavaScript this serves is what reads it; over plain HTTP anyone on the
+# path can replace that JavaScript. See README.md, Deployment.
+#
+# Caddy sets X-Forwarded-For to the address it was connected from, replacing
+# whatever the client sent, and connects from 127.0.0.1, which is why the
+# example config lists 127.0.0.1 in trusted_proxies. Request bodies are
+# streamed through, not buffered, so the server's size, quota and disk checks
+# see them as they arrive.
+
+files.example.org {
+	reverse_proxy 127.0.0.1:8080
+
+	# Once a browser has seen this, it refuses plain HTTP for the host for a
+	# year: a network in the path cannot downgrade a later visit.
+	header Strict-Transport-Security "max-age=31536000"
+}

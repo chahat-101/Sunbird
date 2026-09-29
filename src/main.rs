@@ -7,6 +7,7 @@
 
 mod app;
 mod config;
+mod counters;
 mod db;
 mod http;
 mod limit;
@@ -20,7 +21,10 @@ use std::time::Duration;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::task::JoinSet;
 
 use crate::app::App;
 use crate::config::Config;
@@ -29,6 +33,17 @@ use crate::config::Config;
 /// moment it is (the check is on every read); this bounds only how long its
 /// bytes stay on disk after that.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// How often the counters are saved: a crash loses at most this much of them.
+const SAVE_COUNTERS_EVERY: Duration = Duration::from_secs(60);
+
+/// How often the counters are logged, for reading without a metrics stack.
+const LOG_COUNTERS_EVERY: Duration = Duration::from_secs(3600);
+
+/// How long transfers in progress get to finish after SIGTERM. Not enough for
+/// every 100 MB upload on a slow link; nothing bounded is. deploy/sunbird.service
+/// gives the process longer than this before it kills it.
+const GRACE: Duration = Duration::from_secs(30);
 
 const USAGE: &str = "usage: sunbird [-addr 127.0.0.1:8080] [-data data] [-config sunbird.json]
        sunbird mint-token   a new upload or admin token, and the hash for the config
@@ -143,10 +158,25 @@ async fn main() -> ExitCode {
         flags.data.display()
     );
 
+    // Registered before the first connection, so a SIGTERM from then on is
+    // a shutdown, never the default action, which exits at once and loses
+    // the counters.
+    let (mut sigterm, mut sigint) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(term), Ok(int)) => (term, int),
+        (Err(e), _) | (_, Err(e)) => {
+            log::error!("cannot handle signals: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut background = JoinSet::new();
     // The first tick is immediate: a sweep at startup, then one every
     // SWEEP_EVERY. Without it, a file nobody asks for again would be kept
     // forever: nothing else deletes an expired file.
-    tokio::spawn({
+    background.spawn({
         let app = app.clone();
         async move {
             let mut every = tokio::time::interval(SWEEP_EVERY);
@@ -167,33 +197,116 @@ async fn main() -> ExitCode {
             }
         }
     });
-
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                // Out of file descriptors, most likely. Wait, don't spin or die.
-                log::error!("accept: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+    background.spawn({
         let app = app.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |req| {
-                let app = app.clone();
-                async move { Ok::<_, Infallible>(http::handle(app, peer.ip(), req).await) }
-            });
-            // No overall read timeout: a 100 MB upload on a slow link is
-            // legitimate. The headers get 10 seconds.
-            let served = http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(10))
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
-            if let Err(e) = served {
-                log::debug!("connection: {e}");
+        async move {
+            let start = tokio::time::Instant::now();
+            let mut save =
+                tokio::time::interval_at(start + SAVE_COUNTERS_EVERY, SAVE_COUNTERS_EVERY);
+            let mut report =
+                tokio::time::interval_at(start + LOG_COUNTERS_EVERY, LOG_COUNTERS_EVERY);
+            loop {
+                tokio::select! {
+                    _ = save.tick() => {
+                        let app = app.clone();
+                        match tokio::task::spawn_blocking(move || app.save_counters()).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => log::error!("saving the counters: {e}"),
+                            Err(e) => log::error!("saving the counters panicked: {e}"),
+                        }
+                    }
+                    _ = report.tick() => log::info!("counters: {}", app.counters.json()),
+                }
             }
-        });
+        }
+    });
+
+    let graceful = GracefulShutdown::new();
+    let mut connections = JoinSet::new();
+    let stop = loop {
+        tokio::select! {
+            _ = sigterm.recv() => break "SIGTERM",
+            _ = sigint.recv() => break "SIGINT",
+            // Reaps connections that have ended, so the set holds only live ones.
+            Some(_) = connections.join_next() => {}
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        // Out of file descriptors, most likely. Wait, don't spin or die.
+                        log::error!("accept: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let app = app.clone();
+                let service = service_fn(move |req| {
+                    let app = app.clone();
+                    async move { Ok::<_, Infallible>(http::handle(app, peer.ip(), req).await) }
+                });
+                // No overall read timeout: a 100 MB upload on a slow link is
+                // legitimate. The headers get 10 seconds.
+                let served = graceful.watch(
+                    http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(Duration::from_secs(10))
+                        .serve_connection(TokioIo::new(stream), service),
+                );
+                connections.spawn(async move {
+                    if let Err(e) = served.await {
+                        log::debug!("connection: {e}");
+                    }
+                });
+            }
+        }
+    };
+
+    // Shutdown. Stop accepting; let each connection finish the request it is
+    // on, and close idle ones at once; cut off whatever is still going after
+    // GRACE. Every way out of here saves the counters and closes the
+    // database; none is an early return.
+    drop(listener);
+    log::info!(
+        "{stop}: no longer accepting connections; waiting up to {} s for {} to finish",
+        GRACE.as_secs(),
+        connections.len()
+    );
+    if tokio::time::timeout(GRACE, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        log::warn!(
+            "cutting off {} connections still open after {} s",
+            connections.len(),
+            GRACE.as_secs()
+        );
+    }
+    connections.shutdown().await;
+    background.shutdown().await;
+    // A download cut off ends its claim on a blocking thread, which holds the
+    // app until the refund, and its failed_downloads count, are recorded.
+    // Save only after those.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&app) > 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let saved = app.save_counters();
+    log::info!("counters: {}", app.counters.json());
+    match (saved, Arc::try_unwrap(app)) {
+        (Ok(()), Ok(app)) => {
+            drop(app); // closes the database
+            log::info!("stopped");
+            ExitCode::SUCCESS
+        }
+        (Ok(()), Err(_)) => {
+            log::warn!(
+                "stopped with work still holding the database; it closes as the process exits"
+            );
+            ExitCode::SUCCESS
+        }
+        (Err(e), _) => {
+            log::error!("saving the counters at shutdown: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

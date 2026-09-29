@@ -1,0 +1,53 @@
+# /etc/systemd/system/sunbird.service
+#
+# Expects the binary at /usr/local/bin/sunbird, a system user `sunbird`, and
+# the config at /etc/sunbird/sunbird.json, readable by that user. README.md,
+# Deployment, has the steps.
+
+[Unit]
+Description=Sunbird, end-to-end encrypted file sharing
+After=network.target
+
+[Service]
+Type=exec
+User=sunbird
+Group=sunbird
+ExecStart=/usr/local/bin/sunbird -addr 127.0.0.1:8080 -data /var/lib/sunbird -config /etc/sunbird/sunbird.json
+Environment=RUST_LOG=info
+
+# The data directory: created for the service user, readable by no one else.
+StateDirectory=sunbird
+StateDirectoryMode=0700
+UMask=0077
+
+# SIGTERM, the default stop signal, is a graceful shutdown: no new
+# connections, 30 seconds for transfers in progress, then the counters are
+# saved and the database closed. systemd waits longer than that before
+# SIGKILL, which would lose the counters since their last save (a minute).
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+
+# Nothing but the data directory is writable, and little else is visible.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
