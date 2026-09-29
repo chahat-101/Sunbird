@@ -5,7 +5,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Each counter, as its row in the `counters` table names it. The names are
 /// the ones schema version 5 already stored (tests/fixtures/schema-v5), so a
 /// database written before this rewrite carries on counting.
 #[derive(Clone, Copy, Debug)]

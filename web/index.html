@@ -7,62 +7,28 @@
 <link rel="stylesheet" href="/app.css">
 
 <header class="masthead">
-  <h1>Sunbird</h1>
-  <p class="tagline">Send a file, encrypted on your device before it leaves.</p>
+  <div>
+    <h1 class="wordmark">Sunbird</h1>
+    <p class="tagline">Send a file, encrypted on your device before it leaves.</p>
+  </div>
+  <span class="hero" role="img" aria-label="Two sunbirds on orange tecoma flowers"></span>
 </header>
 
 <main id="upload" hidden>
-  <section class="card">
+<div class="columns">
+<div class="column">
+  <section class="section decide">
     <h2>File</h2>
     <label id="drop-zone" class="drop" data-chosen="no">
       <input id="file" type="file" class="visually-hidden">
+      <span class="drop-glyph"><svg class="icon icon-upload" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg><svg class="icon icon-file" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></span>
       <span id="drop-empty"><strong>Choose a file</strong> or drop it here</span>
       <span id="drop-chosen" hidden><span id="chosen-name"></span> <span id="chosen-size" class="hint"></span></span>
       <span class="hint">One file, up to 100 MiB.</span>
     </label>
   </section>
 
-  <section class="card">
-    <h2>Who can open it</h2>
-    <label class="check"><input id="protect" type="checkbox"> Require a passphrase</label>
-    <p id="mode-public" class="mode mode-public"><strong>Public link</strong>: anyone who has the link can
-      open this file. There is no passphrase or other second factor.</p>
-    <p id="mode-restricted" class="mode mode-restricted" hidden><strong>Passphrase-protected</strong>: the
-      file opens only with the link and the passphrase together. Send the passphrase separately from the link.</p>
-    <label class="field" for="passphrase">Passphrase</label>
-    <input id="passphrase" type="password" autocomplete="new-password" disabled>
-    <p id="passphrase-hint" class="hint">Length is what makes a passphrase hard to guess: a few ordinary
-      words beat one short word full of symbols, and are easier to say aloud. It is used exactly as typed,
-      spaces included. <span id="passphrase-length">0 characters</span></p>
-  </section>
-
-  <section class="card">
-    <h2>Limits</h2>
-    <div class="pair">
-      <div>
-        <label class="field" for="expiry">Expires after</label>
-        <select id="expiry">
-          <option value="3600">1 hour</option>
-          <option value="86400" selected>24 hours</option>
-          <option value="259200">3 days</option>
-          <option value="604800">7 days</option>
-        </select>
-      </div>
-      <div>
-        <label class="field" for="downloads">Download limit</label>
-        <select id="downloads">
-          <option value="1" selected>1 download</option>
-          <option value="5">5 downloads</option>
-          <option value="10">10 downloads</option>
-          <option value="0">No download limit (expires by time only)</option>
-        </select>
-      </div>
-    </div>
-    <p class="hint">These limits are sealed into the file, and cannot be changed after upload. The server
-      stops serving the file and deletes it when the first one is reached.</p>
-  </section>
-
-  <section class="card">
+  <section class="section decide">
     <h2>Upload token</h2>
     <label class="field" for="upload-token">Your upload token</label>
     <input id="upload-token" type="password" autocomplete="off" spellcheck="false">
@@ -71,13 +37,58 @@
       and remove it. Anyone with your token uploads as you.</p>
     <label class="check"><input id="remember-token" type="checkbox"> Remember the token in this browser</label>
   </section>
+</div>
 
-  <section class="card commit">
+<div class="column">
+  <section class="section decide">
+    <h2>Who can open it</h2>
+    <label class="check"><input id="protect" type="checkbox"> Require a passphrase</label>
+    <p id="mode-public" class="mode mode-public"><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3C9.5 5.6 8.2 8.6 8.2 12s1.3 6.4 3.8 9"/></svg><span><strong>Public link</strong>: anyone who has the link can
+      open this file. There is no passphrase or other second factor.</span></p>
+    <p id="mode-restricted" class="mode mode-restricted" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg><span><strong>Passphrase-protected</strong>: the
+      file opens only with the link and the passphrase together. Send the passphrase separately from the link.</span></p>
+    <label class="field" for="passphrase">Passphrase</label>
+    <input id="passphrase" type="password" autocomplete="new-password" disabled>
+    <p id="passphrase-hint" class="hint">Length is what makes a passphrase hard to guess: a few ordinary
+      words beat one short word full of symbols, and are easier to say aloud. It is used exactly as typed,
+      spaces included. <span id="passphrase-length">0 characters</span></p>
+  </section>
+
+  <section class="section decide">
+    <h2>Limits</h2>
+    <div class="pair">
+      <div>
+        <label class="field" for="expiry">Expires after</label>
+        <span class="select">
+        <select id="expiry">
+          <option value="3600">1 hour</option>
+          <option value="86400" selected>24 hours</option>
+          <option value="259200">3 days</option>
+          <option value="604800">7 days</option>
+        </select><svg class="icon chevron" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6.5 9.5 5.5 5.5 5.5-5.5"/></svg></span>
+      </div>
+      <div>
+        <label class="field" for="downloads">Download limit</label>
+        <span class="select">
+        <select id="downloads">
+          <option value="1" selected>1 download</option>
+          <option value="5">5 downloads</option>
+          <option value="10">10 downloads</option>
+          <option value="0">No download limit (expires by time only)</option>
+        </select><svg class="icon chevron" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6.5 9.5 5.5 5.5 5.5-5.5"/></svg></span>
+      </div>
+    </div>
+    <p class="hint">These limits are sealed into the file, and cannot be changed after upload. The server
+      stops serving the file and deletes it when the first one is reached.</p>
+  </section>
+
+  <section class="section commit">
     <button id="upload-button" type="button" class="primary">Encrypt and upload
       <span class="button-mode">(<span id="upload-mode">public link</span>)</span></button>
     <p id="upload-status" class="status" role="status"></p>
     <ol id="upload-steps" class="steps" hidden>
       <li data-step="stretch" data-state="pending">
+        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
         <span class="step-name">Stretching the passphrase</span>
         <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on
           purpose: every guess at the passphrase costs this much, for anyone who gets the link and the
@@ -86,11 +97,13 @@
         <span class="step-detail"></span>
       </li>
       <li data-step="encrypt" data-state="pending">
+        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
         <span class="step-name">Encrypting on this device</span>
         <progress max="1" value="0"></progress>
         <span class="step-detail"></span>
       </li>
       <li data-step="upload" data-state="pending">
+        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
         <span class="step-name">Uploading</span>
         <progress max="1" value="0"></progress>
         <span class="step-detail"></span>
@@ -98,7 +111,7 @@
     </ol>
   </section>
 
-  <section id="result" class="card result" hidden>
+  <section id="result" class="section result" hidden>
     <h2>Uploaded</h2>
     <label class="field" for="link">Link</label>
     <div class="copy-row">
@@ -106,10 +119,10 @@
       <button id="copy-link" type="button">Copy link</button>
     </div>
     <p id="copy-link-status" class="status" role="status"></p>
-    <p id="link-public" class="mode mode-public" hidden>This link is the whole key. Anyone who has all of it
-      can open the file, and nothing else is asked for, so share it only with the people who should have the file.</p>
-    <p id="link-restricted" class="mode mode-restricted" hidden>This link alone does not open the file: the
-      passphrase is needed too. Send the passphrase by a different route from the link.</p>
+    <p id="link-public" class="mode mode-public" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3C9.5 5.6 8.2 8.6 8.2 12s1.3 6.4 3.8 9"/></svg><span>This link is the whole key. Anyone who has all of it
+      can open the file, and nothing else is asked for, so share it only with the people who should have the file.</span></p>
+    <p id="link-restricted" class="mode mode-restricted" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg><span>This link alone does not open the file: the
+      passphrase is needed too. Send the passphrase by a different route from the link.</span></p>
     <p class="hint">The part after the <code>#</code> is the key to the file. It never reaches
       the server: browsers do not send it.</p>
     <div class="token-box">
@@ -123,15 +136,17 @@
         server keeps only a fingerprint of it.</p>
     </div>
   </section>
+</div>
+</div>
 </main>
 
 <main id="download" hidden>
-  <section class="card">
+  <section class="section receive">
     <h2>Receive a file</h2>
-    <p id="download-public" class="mode mode-public" hidden><strong>Public link</strong>: this file opens with
-      the link alone. No passphrase is needed.</p>
-    <p id="download-restricted" class="mode mode-restricted" hidden><strong>Passphrase-protected</strong>: this
-      file opens only with the link and its passphrase together.</p>
+    <p id="download-public" class="mode mode-public" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3C9.5 5.6 8.2 8.6 8.2 12s1.3 6.4 3.8 9"/></svg><span><strong>Public link</strong>: this file opens with
+      the link alone. No passphrase is needed.</span></p>
+    <p id="download-restricted" class="mode mode-restricted" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg><span><strong>Passphrase-protected</strong>: this
+      file opens only with the link and its passphrase together.</span></p>
     <p id="download-status" class="status" role="status"></p>
     <form id="unlock" hidden>
       <label class="field" for="unlock-passphrase">Passphrase</label>
@@ -142,6 +157,7 @@
     </form>
     <ol id="download-steps" class="steps" hidden>
       <li data-step="stretch" data-state="pending">
+        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
         <span class="step-name">Stretching the passphrase</span>
         <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on
           purpose: every guess at the passphrase costs this much, for anyone who gets the link and the
@@ -150,11 +166,13 @@
         <span class="step-detail"></span>
       </li>
       <li data-step="download" data-state="pending">
+        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
         <span class="step-name">Downloading the encrypted file</span>
         <progress max="1" value="0"></progress>
         <span class="step-detail"></span>
       </li>
       <li data-step="decrypt" data-state="pending">
+        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
         <span class="step-name">Decrypting and checking every piece</span>
         <progress max="1" value="0"></progress>
         <span class="step-detail"></span>
@@ -162,7 +180,7 @@
     </ol>
   </section>
 
-  <section id="details" class="card" hidden>
+  <section id="details" class="section details" hidden>
     <p id="expired-warning" role="alert" hidden></p>
     <dl class="facts">
       <dt>Name</dt><dd id="file-name"></dd>

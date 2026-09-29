@@ -1,227 +1,98 @@
 # Sunbird
 
-End-to-end encrypted file sharing for a small group. The browser does all the
-cryptography; the server stores blobs it cannot read. The server hashes tokens
-with SHA-256 and compares them in constant time. That is all the cryptography
-it does, and it never looks inside a blob.
+End-to-end encrypted file sharing for a small group, such as a club. Upload a
+file, get a link, send it. The file is encrypted in your browser before it
+leaves your device, and the key is in the part of the link after `#`, which
+browsers never send to the server. The file is deleted when its time runs out
+(24 hours by default, 7 days at most) or its downloads are used up. Only
+members with an upload token can upload; anyone with the link can download.
 
-Licensed under the AGPL-3.0 (`LICENSE`): a hosted fork must publish the JavaScript it ships, the only lever against D1's excluded case, an operator serving modified JavaScript.
+Licensed under the AGPL-3.0. The exception is the photograph of two
+sunbirds in `web/assets/` (`sunbird.jpg` and `sunbird.webp`, both cropped
+from it), which is not the project's work and is not covered by the AGPL.
+Its source and licence are not recorded yet.
 
-- `protocol.md` is the wire format, version 1. Links already shared depend on
-  it, so version 1 does not change: a change to the format is a new version,
-  which a client recognises or refuses (§9).
-- `DECISIONS.md` records what was chosen and why, so that a later change is a
-  deliberate reversal rather than drift.
-- `web/` is the browser client, built into the binary.
-- `src/` is the server: `http.rs` (routes and handlers), `app.rs` (the data
-  directory and the values requests carry), `db.rs` (schema and migrations),
-  `config.rs` (members, admins, quotas, the disk floor), `limit.rs` (rate
-  limits and the client address), `counters.rs` (the totals it keeps about
-  itself). `src/migrations/` is frozen once shipped, like the protocol.
-- `deploy/` is one way to run it: a Caddyfile, a systemd unit, an example
-  config.
+## The interface
 
-## Limitations
+One page, built into the server binary, with no framework and no build step.
 
-What the design does not do, so that nobody claims it does:
+**Theme.** Ink on warm paper: an off-white page (`#f6f5f1`, near-black in
+dark mode, which follows the device automatically), near-black text, and
+the system font on a deliberate scale: small capitals for labels, larger
+type for what they label. The name is set in an old-style serif from the
+system (Iowan, Palatino, or a clone of it). Colour is kept for meaning, so
+it stands out:
 
-- **Not zero-knowledge.** Whoever runs the server cannot read your files. They
-  could, in principle, ship you modified JavaScript that leaks your key; a
-  native client would be needed to close that (D1, D8).
-- **Size and timing leak.** The server sees each blob's size, when it was
-  uploaded and by which member, and when it is downloaded, from which address.
-- **Not per-recipient.** Anyone with the link, and the passphrase if there is
-  one, can open the file. Revoking for one revokes for all.
-- **Limits are sealed, not enforced by the seal.** A client can check that the
-  expiry and download limit are the ones the uploader chose; it cannot check
-  that the server honoured them (D6, protocol.md §8).
-- **"Deleted" means what was checked.** When a file expires, is used up, or is
-  deleted, its blob is unlinked and then confirmed gone from the data
-  directory; a failure is logged as `DELETION FAILED`, counted, and retried
-  every sweep until it succeeds. That is all that is verified. It is not a
-  secure erase: a filesystem snapshot, a backup, or the disk itself can still
-  hold the (encrypted) bytes.
-- **A download counted is not a file received.** See Counters.
+- **orange**, the photo's flowers, is the name and the one action to take:
+  upload, open, download;
+- **green** is success and progress: the bars, the finished steps,
+  "Uploaded.", "Downloaded.";
+- **amber**, with a globe, marks a *public link*, which opens for anyone who
+  has it;
+- **red** is only for errors, and for the one warning a recipient must not
+  miss: a file served after its expiry date.
+
+A *passphrase-protected* link is marked by its lock and its words, in ink.
+
+**Layout.** The upload page opens with the name and tagline on the left
+and the photograph beside them. Below, divided by space and hairline rules
+rather than boxes, are the decisions, numbered in the order you make them:
+01 *File* and 02 *Upload token* (what is sent, and by whom), then 03 *Who
+can open it* and 04 *Limits* (who can open it, and for how long), then one
+button, whose label says what you are about to make: "Encrypt and upload
+(public link)". On a wide screen the two pairs sit side by side; below
+60rem it is one column in the same order. The waits (stretching
+the passphrase, encrypting, uploading; downloading, decrypting) are a
+timeline: each step a marker that fills as it finishes, and only the step
+under way shows its bar and why it takes as long as it does. The recipient's
+page is the same style: which kind of link it is, the file's details, then a
+Download button.
+
+**Design choices.**
+
+- **Say what is happening.** Every wait is a named step with its own
+  progress. The slow step says why it is slow on purpose.
+- **Say it before, not after.** The page explains a public link before the
+  upload, not in the result. The owner token is shown once, in a heavy
+  box saying so.
+- **Built for phones.** Every control is at least 44 px tall, inputs use
+  16 px text so phones do not zoom, and nothing scrolls sideways at 390 px.
+- **Accessible.** A visible focus ring, status messages announced to screen
+  readers, and no animation when the device asks for reduced motion.
+- **Safe to display.** Decrypted file names are shown as plain text, never
+  HTML. The page loads only its own scripts, styles and one photo.
+
+The recipient's page has no photo and no display type (the name is at a
+reading size), and does not fetch the image.
+
+The files are `web/index.html`, `web/app.css`, `web/src/app.js` and
+`web/assets/`.
 
 ## Running
 
     cargo build --release
-    target/release/sunbird mint-id       # one per person, once
-    target/release/sunbird mint-token    # the token for them, the hash for the config
+    target/release/sunbird mint-id       # an id for each member or admin
+    target/release/sunbird mint-token    # their token, and its hash for the config
     target/release/sunbird -addr 127.0.0.1:8080 -data data -config sunbird.json
 
-The binary is the whole server: the client is built into it, and it needs no
-`web/` directory beside it.
+Start the config from `deploy/sunbird.example.json`. Every limit in it is
+required. The binary needs no `web/` directory beside it.
 
-The config lists members (id, name, token hash, quotas), admins, trusted
-proxies, the two rate limits and the disk floor. Every limit is required: the
-server has no defaults. `deploy/sunbird.example.json` shows the shape; its
-numbers are an illustration, not advice (see Deployment). An admin deletes any
-file with `DELETE /api/admin/<id>` and `Authorization: Bearer <admin token>`;
-the deletion is logged with the admin, the file and the uploader.
+    cargo test
+    node web/test/e2e.mjs firefox        # or chromium; add --phone
 
-On SIGTERM or SIGINT the server stops accepting connections, gives transfers
-in progress 30 seconds to finish, cuts off the rest, saves the counters,
-closes the database and exits 0.
+## Limitations
 
-    cargo test                           # the Rust tests
-    node web/test/run.mjs firefox        # crypto.html, client only
-    node web/test/e2e.mjs chromium --phone
+- **Not zero-knowledge.** The server cannot read your files, but it serves the
+  JavaScript that does the encryption, so a dishonest operator could change
+  it. A native client would be needed to close that.
+- The server sees each file's size and when it is uploaded and downloaded.
+- Anyone with the link (and passphrase, if set) can open the file.
+- "Deleted" means removed from disk and checked gone, not securely erased.
 
-The browser tests need Node 22 and Firefox or Chromium, found as described in
-`web/test/browser.mjs`. e2e.mjs also needs `cargo` on PATH.
+## More
 
-## Counters
-
-The server counts, in totals only: never which file, never which member.
-
-    curl -H "Authorization: Bearer <admin token>" https://files.example.org/admin/stats
-
-returns them as JSON (401 without an admin token). The same line is logged
-every hour and at shutdown, as `counters: {...}`. They are kept in memory,
-saved to the database every minute and at shutdown, and carried on after a
-restart. A crash, or a SIGKILL, loses at most the last minute of them.
-
-| counter | counts |
-|---|---|
-| `uploads`, `bytes_uploaded` | files stored, and their blob bytes |
-| `downloads` | downloads the server completed (below) |
-| `failed_downloads` | downloads started and not completed; each was refunded |
-| `failed_uploads` | uploads by a member, within their limits, that stored nothing: the client went away, the server failed, or shutdown cut them off. Refusals (401, 413, 429, 507) are not failures |
-| `expired_swept` | files the sweeper deleted after their expiry time |
-| `deletion_failures` | failed deletion attempts, one per attempt: a stuck file adds one a minute until it goes. Should stay 0 |
-| `rate_limited_uploads`, `rate_limited_reads` | 429s from each limiter |
-| `uploads_refused_low_disk` | 507s at the disk floor |
-| `counting_since` | Unix time the totals start from |
-
-**What "completed" means.** A download counts as completed when the server
-has handed the last bytes of the blob to its HTTP layer for the connection.
-To a client that has stopped reading, that layer may still be holding up to
-about 400 KiB of it unsent. Behind a reverse proxy, "sent" means the proxy
-has the bytes, not the recipient. A
-proxy buffers a small file whole, so a recipient who drops off partway may
-still have used up the file's one download. `failed_downloads` undercounts
-for the same reason: a transfer that dies after the proxy has the bytes is
-not a failure the server can see. The count is of transfers the server
-completed, not of files people received. When someone reports "the link says
-it was used but I never got the file", check this first.
-
-## Deployment
-
-`deploy/` holds one layout: Caddy on the same machine terminating TLS, the
-server on 127.0.0.1:8080 under systemd.
-
-1. Build with `cargo build --release` and copy `target/release/sunbird` to
-   `/usr/local/bin/`.
-2. `useradd --system --no-create-home --shell /usr/sbin/nologin sunbird`.
-3. Write `/etc/sunbird/sunbird.json` from `deploy/sunbird.example.json`,
-   owned by root, group `sunbird`, mode 0640. It holds only hashes, but it is
-   the list of who may upload.
-4. Install `deploy/sunbird.service` in `/etc/systemd/system/`, then
-   `systemctl enable --now sunbird`. The data directory is
-   `/var/lib/sunbird`, mode 0700.
-5. Put your host name in `deploy/Caddyfile` and install it as Caddy's config.
-
-### TLS is not optional
-
-The fragment of a link, the key, never reaches the server. But the
-JavaScript the server sends is what reads the fragment and does the
-decryption. Over plain HTTP anyone on the path, the café Wi-Fi or the
-campus network, can replace that JavaScript with one that sends the key
-somewhere else. That is D1's excluded case, an operator serving modified
-JavaScript, handed to anyone who can get between the browser and the
-server. Serve it over HTTPS only. The Caddyfile redirects plain HTTP and sets
-HSTS, so a browser that has visited once will not accept plain HTTP from
-the host again.
-
-### Picking the numbers
-
-Quotas bound each member, not the disk. The worst case is every member full
-at once:
-
-    members × max_active_bytes + min_free_bytes  ≤  free space on the disk
-
-**This must hold.** If it does not, uploads are refused with 507 at the floor
-once the disk fills, and every member gets that refusal, not just the ones
-who filled it. Without a floor the disk would run out mid-write, and uploads
-would fail at 90%.
-
-- `max_active_bytes`: at least the largest file a member should be able to
-  send (the ceiling is about 100 MB), times how many they may have live at
-  once. Divide the disk by the number of members first, then pick.
-- `max_active_files`: how many live links one person needs. Tens, not
-  thousands.
-- `max_bytes_per_week`: bounds churn. Deleting a file does not give any of
-  it back, so upload-delete-repeat cannot get around it. A small multiple of
-  `max_active_bytes`.
-- `min_free_bytes`: room for everything else that writes to this disk (the
-  database and its WAL, the journal, the OS), plus 1 MiB for every upload that
-  might be in progress at once. The floor is checked before an upload's body
-  against its declared length, and again at least every MiB while it streams,
-  so parallel uploads can each write up to 1 MiB past the last check. A few
-  GB, or 5% of the disk, whichever is larger.
-- `upload_rate`, per member: uploads need a member's token, so the quotas
-  already do the real limiting. This is a brake on a script, or on a leaked
-  token. A few dozen an hour.
-- `read_rate`, per client address (an IPv6 /64 counts as one address),
-  covers previews and downloads. Opening a
-  link costs two requests: the preview, and the download if the recipient
-  goes on.
-
-Every campus, school or office behind one NAT address is a single client to
-the download limit: a lecture hall opening one link at once is one address
-making hundreds of requests. Downloads are unauthenticated, since the link
-is all a recipient has, so there is nothing else to key the limit on, and no
-cleverer limiter fixes it. Size `read_rate` for the largest room that will
-open one link together: at least twice its headcount in `requests`, over a
-few minutes in `seconds`. The limit refills evenly across its window, so
-`{"requests": 600, "seconds": 300}` allows a burst of 600, then two a
-second. Then watch `rate_limited_reads`, `failed_downloads` and
-`failed_uploads` in `/admin/stats`. A rising 429 count after a class is a
-limit set too low for that room.
-
-### Members
-
-Config changes take effect on a restart (`systemctl restart sunbird`, which
-is a graceful shutdown and a start).
-
-- **To add a member**, run `sunbird mint-id` and `sunbird mint-token`. Add an
-  entry with that id, a name, the token hash and the three quotas, restart,
-  and give them the token. Check that the disk sum above still holds.
-- **To remove a member**, delete their entry and restart. Their token stops
-  working at once. **Their files are not deleted.** They stay recorded under
-  the member's id, and are served until they expire (at most 7 days after
-  upload) or are used up. To take them down sooner, an admin deletes each
-  with `DELETE /api/admin/<id>`. There is no endpoint that lists a member's
-  files, by design, so the ids come from the database:
-  `SELECT id FROM blobs WHERE uploader_id = '<member id>'`.
-- **A lost or leaked token** is a new `mint-token` for the same entry: the id,
-  and so the files and quota, stay theirs.
-
-### Backups
-
-Think before backing up. A blob is useless without its link, and the links
-exist only in whoever's chat window they were pasted into; the server never
-had them. So a backup can never help anyone open a file whose link is gone.
-It can only bring back state:
-
-- **The database alone, restored** after files have expired: its rows point at
-  blobs that were deleted since. Rows with time left come back, and 404 on
-  download, having no blob. Worse, the server deletes at startup every blob
-  with no row, which is every file uploaded since the backup. The counters and
-  the upload ledger go back to the backup's values too.
-- **The database and blobs together, restored:** files come back that were
-  used up, deleted by their owner, or taken down by an admin. **Every takedown
-  since the backup must be done again**, from the admin log lines
-  (`ADMIN DELETE`).
-
-For most groups the right backup is the config file only.
-
-### Upgrades
-
-The database schema is changed only by migrations (`src/migrations/`, and
-`MIGRATIONS` in `src/db.rs`). From the first real deployment, every shipped
-migration is frozen: a change is a new migration appended to the list, never
-an edit to an old one, not even its whitespace. A database that ran the old
-text keeps its result forever, with nothing to tell it apart. A binary that
-meets a database newer than itself refuses to start and changes nothing.
+- `deploy/README.md`: running it for real, with counters, TLS, limits,
+  members, backups and upgrades.
+- `DECISIONS.md`: what was chosen and why.
+- `protocol.md`: the file format, version 1.

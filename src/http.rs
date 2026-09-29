@@ -102,10 +102,12 @@ fn internal<E: Display>(message: &'static str) -> impl FnOnce(E) -> ApiError {
 }
 
 /// Lets pages run only the client's own scripts, and hash-wasm compile its
-/// WebAssembly. The client renders decrypted metadata, which is hostile input,
-/// as text; this is the backstop if that ever slips.
+/// WebAssembly, and show images from its own origin (the masthead photo). The
+/// client renders decrypted metadata, which is hostile input, as text; this is
+/// the backstop if that ever slips. `img-src 'self'` does not weaken that: the
+/// page never makes an image of a file (the file is never previewed).
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
-    style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// Answers `req`, which came over a connection from `peer`.
 pub async fn handle<B>(app: Arc<App>, peer: IpAddr, req: Request<B>) -> Response<Body>
@@ -589,7 +591,7 @@ const INDEX: &[u8] = include_bytes!("../web/index.html");
 
 /// The files index.html loads. Nothing else in web/ is built in or served: no
 /// tests, no directory listings.
-const ASSETS: [(&str, &str, &[u8]); 7] = [
+const ASSETS: [(&str, &str, &[u8]); 9] = [
     (
         "/app.css",
         "text/css; charset=utf-8",
@@ -624,6 +626,16 @@ const ASSETS: [(&str, &str, &[u8]); 7] = [
         "/vendor/hash-wasm/LICENSE",
         "text/plain; charset=utf-8",
         include_bytes!("../web/vendor/hash-wasm/LICENSE"),
+    ),
+    (
+        "/assets/sunbird.webp",
+        "image/webp",
+        include_bytes!("../web/assets/sunbird.webp"),
+    ),
+    (
+        "/assets/sunbird.jpg",
+        "image/jpeg",
+        include_bytes!("../web/assets/sunbird.jpg"),
     ),
 ];
 
@@ -1339,6 +1351,8 @@ pub(crate) mod tests {
                 "text/javascript; charset=utf-8",
             ),
             ("/vendor/hash-wasm/LICENSE", "text/plain; charset=utf-8"),
+            ("/assets/sunbird.webp", "image/webp"),
+            ("/assets/sunbird.jpg", "image/jpeg"),
         ] {
             let r = get(&s, path).await;
             assert_eq!(r.status, StatusCode::OK, "GET {path}");

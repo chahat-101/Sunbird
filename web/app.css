@@ -1,44 +1,78 @@
-/* One stylesheet, served from 'self' (the CSP allows no inline styles). */
+/* One stylesheet, served from 'self' (the CSP allows no inline styles).
+
+   The CSP allows no fonts (no font-src, so default-src 'none'), and images
+   only from 'self', and only one is built in: the masthead photo. So the
+   type is the system's, and every icon is an inline <svg> in the page, never
+   a url() here. Status lines are set with textContent, which would remove
+   any child, so their markers are drawn below with pseudo-elements.
+
+   Colour is kept for meaning. Orange, the photo's tecoma, is the name and
+   the one action to take (upload, open, download). Green is success and
+   progress. Amber is the public-link warning. Red is an error or the §8
+   expiry warning. Everything else, the passphrase-protected mode included,
+   is ink on paper, so those keep their force. */
 
 :root {
   color-scheme: light dark;
-  --bg: #f5f4ef;
-  --card: #ffffff;
-  --text: #1c1c1a;
-  --muted: #5a5954;
-  --line: #d9d7ce;
-  --field: #fbfaf7;
-  --accent: #1f5f4a;
-  --accent-text: #ffffff;
-  --focus: #2563b0;
+  --paper: #f6f5f1;
+  --surface: #ffffff;
+  --well: #eeede7;
+  --ink: #1a1a18;
+  --ink-hover: #3a3a36;
+  --ink-2: #3f3e3a;
+  --muted: #676660;
+  --line: #e1dfd7;
+  --line-strong: #c4c2b8;
+  --on-ink: #f6f5f1;
+  --focus: #2d5bd0;
   --public: #8a5200;
-  --public-bg: #fff3dc;
-  --restricted: #1f5f4a;
-  --restricted-bg: #e2f1ea;
+  --public-bg: #fbeed5;
+  --accent: #c2410c;       /* white on it: 5.2:1 */
+  --accent-hover: #a8390a;
+  --on-accent: #ffffff;
+  --success: #1d6b37;
   --error: #b00020;
-  --error-bg: #fdebed;
-  --done: #1d6b37;
+  --error-bg: #fbe8ea;
+
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  /* The wordmark: an old-style serif from the system (a vendored face would
+     need font-src and another built-in file). Iowan on Apple devices,
+     Palatino on Windows, its URW clone P052 on Linux, then Charter, Georgia. */
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "P052", "URW Palladio L",
+    "Book Antiqua", Charter, "Bitstream Charter", Georgia, serif;
+  /* Roughly 1.25 between steps, so a heading never looks like a value. */
+  --t-label: 0.75rem;    /* 12: small caps labels, section numbers */
+  --t-small: 0.875rem;   /* 14: hints, step details */
+  --t-body: 1rem;        /* 16 */
+  --t-value: 1.125rem;   /* 18: values, the active step */
+  --t-heading: 1.375rem; /* 22: section titles */
+  --t-title: 1.75rem;    /* 28: "Uploaded" */
   --radius: 12px;
+  --wide: 66rem;           /* the upload page on a wide screen */
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #151513;
-    --card: #1f1f1c;
-    --text: #ecebe5;
-    --muted: #a8a79f;
-    --line: #3a3934;
-    --field: #171715;
-    --accent: #5fbf9a;
-    --accent-text: #0c1e17;
-    --focus: #7fb2ff;
-    --public: #ffc76b;
-    --public-bg: #372a10;
-    --restricted: #8fdcbc;
-    --restricted-bg: #15332a;
-    --error: #ff8994;
-    --error-bg: #3b1519;
-    --done: #8fdca8;
+    --paper: #121211;
+    --surface: #1b1b19;
+    --well: #1d1d1a;
+    --ink: #efeee8;
+    --ink-hover: #d6d5ce;
+    --ink-2: #cfcec7;
+    --muted: #9e9d95;
+    --line: #2b2a27;
+    --line-strong: #46453f;
+    --on-ink: #121211;
+    --focus: #8aa9ff;
+    --public: #f2b95c;
+    --public-bg: #2c2210;
+    --accent: #f0864a;     /* #121211 on it: 7.3:1 */
+    --accent-hover: #f5a06b;
+    --on-accent: #121211;
+    --success: #84d4b1;
+    --error: #ff8a95;
+    --error-bg: #35131a;
   }
 }
 
@@ -51,93 +85,143 @@
 
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+  font: var(--t-body)/1.55 var(--sans);
+  -webkit-text-size-adjust: 100%;
 }
 
-.masthead, main { max-width: 40rem; margin: 0 auto; padding: 0 1rem; }
-.masthead { padding-top: 1.5rem; }
-main { padding-bottom: 3rem; }
-h1 { font-size: 1.75rem; line-height: 1.2; margin: 0; }
-h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
-p { margin: 0.5rem 0; }
-code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-.tagline, .hint { color: var(--muted); }
-.hint { font-size: 0.9rem; }
+.masthead, main { max-width: 38rem; margin: 0 auto; padding: 0 1.25rem; }
+.masthead { padding-top: 2.5rem; padding-bottom: 2rem; }
+main { padding-bottom: 5rem; }
 
-.card {
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 1rem;
-  margin: 1rem 0;
+/* Quiet by default, and always on the download page: someone there is
+   decrypting a file and reading warnings, so the name is just a name, in
+   the same face and colour as the upload page's, at a reading size. */
+h1 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: var(--t-title);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  color: var(--accent);
 }
+.tagline { margin: 0.35rem 0 0; font-size: var(--t-body); color: var(--muted); }
+.hero { display: none; }
+h2 { font-size: var(--t-heading); line-height: 1.25; font-weight: 650; letter-spacing: -0.015em; margin: 0 0 1.25rem; }
+p { margin: 0.6rem 0; }
+code { font-family: var(--mono); font-size: 0.92em; }
+.hint { font-size: var(--t-small); color: var(--muted); }
 
-/* ---- controls: every tap target at least 44 px tall ---------------------- */
+.icon { width: 1.25rem; height: 1.25rem; flex: none; }
 
-.field { display: block; font-weight: 600; margin: 0.75rem 0 0.25rem; }
+/* ---- sections: space and a hairline, not boxes ------------------------------- */
+
+.section { padding: 2.25rem 0; border-top: 1px solid var(--line); }
+#upload { counter-reset: decide; }
+/* The decisions, in the order they are made. */
+.decide h2 { display: flex; align-items: baseline; gap: 0.75rem; counter-increment: decide; }
+.decide h2::before {
+  content: counter(decide, decimal-leading-zero);
+  font-size: var(--t-label);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.commit { border-top: 0; padding-top: 0.5rem; }
+
+/* ---- controls: every tap target at least 44 px tall -------------------------- */
+
+/* Labels are small and set in capitals; what they label is larger. */
+.field {
+  display: block;
+  margin: 1.25rem 0 0.45rem;
+  font-size: var(--t-label);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
 
 input[type="text"], input[type="password"], select {
   display: block;
   width: 100%;
-  min-height: 2.75rem;
-  padding: 0.5rem 0.75rem;
+  min-height: 2.875rem;
+  padding: 0.55rem 0.8rem;
   font: inherit; /* 16 px: phones do not zoom into the field */
   color: inherit;
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  transition: border-color 0.15s;
 }
-input:disabled { opacity: 0.5; cursor: not-allowed; }
+input[type="text"]:hover, input[type="password"]:hover:not(:disabled), select:hover { border-color: var(--ink-2); }
+input:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* The native arrow, replaced by an inline one: a CSS url() icon is an image,
+   which the CSP refuses. */
+.select { position: relative; display: block; }
+.select select { appearance: none; padding-right: 2.5rem; cursor: pointer; }
+.select .chevron { position: absolute; right: 0.8rem; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
+/* The list itself keeps the platform's colours. */
+select option { color: initial; background: initial; }
 
 button {
-  min-height: 2.75rem;
-  padding: 0.5rem 1rem;
+  min-height: 2.875rem;
+  padding: 0.55rem 1.1rem;
   font: inherit;
   font-weight: 600;
-  color: var(--text);
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+button:hover:not(:disabled) { border-color: var(--ink-2); }
+button.primary {
+  width: 100%;
+  min-height: 3.25rem;
+  font-size: var(--t-value);
+  color: var(--on-accent);
+  background: var(--accent);
+  border-color: var(--accent);
+  border-radius: var(--radius);
+}
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button:disabled { opacity: 0.55; cursor: progress; }
+/* The mode wraps whole, never at its hyphen. */
+.button-mode { font-weight: 400; white-space: nowrap; }
+
+/* Focus: a ring set off from the control by a band of the page's colour, so
+   it reads on the ink button, the fields and the drop zone alike. The
+   transparent outline is what forced-colours mode draws instead. */
+:focus-visible, .drop:has(input:focus-visible) {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--paper), 0 0 0 4.5px var(--focus);
+}
+input:focus-visible, select:focus-visible { border-color: var(--focus); }
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  min-height: 2.75rem;
+  font-weight: 600;
   cursor: pointer;
 }
-button.primary { width: 100%; color: var(--accent-text); background: var(--accent); border-color: transparent; }
-button:disabled { opacity: 0.6; cursor: progress; }
-.button-mode { font-weight: 400; }
+.check input { width: 1.3rem; height: 1.3rem; margin: 0; accent-color: var(--ink); cursor: pointer; }
 
-:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
-
-.check { display: flex; align-items: center; gap: 0.6rem; min-height: 2.75rem; font-weight: 600; cursor: pointer; }
-.check input { width: 1.25rem; height: 1.25rem; margin: 0; accent-color: var(--accent); }
-
-.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); column-gap: 1rem; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 1rem; }
+.pair .field { margin-top: 0; }
 
 .copy-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .copy-row > input, .copy-row > code { flex: 1 1 14rem; min-width: 0; }
 .copy-row > button { flex: 0 0 auto; }
 .copy-row > button.primary { width: auto; }
-
-/* ---- file ------------------------------------------------------------------ */
-
-.drop {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-  min-height: 8rem;
-  padding: 1rem;
-  text-align: center;
-  border: 2px dashed var(--line);
-  border-radius: var(--radius);
-  cursor: pointer;
-}
-.drop:focus-within { outline: 3px solid var(--focus); outline-offset: 2px; }
-.drop[data-dragging] { border-color: var(--accent); background: var(--restricted-bg); }
-.drop[data-chosen="yes"] { border-style: solid; }
-#chosen-name { font-weight: 600; overflow-wrap: anywhere; }
 
 .visually-hidden {
   position: absolute;
@@ -148,109 +232,368 @@ button:disabled { opacity: 0.6; cursor: progress; }
   white-space: nowrap;
 }
 
-/* ---- which kind of link ---------------------------------------------------- */
+/* ---- the drop zone: the first thing anyone sees ------------------------------ */
 
-.mode { padding: 0.6rem 0.75rem; border-left: 4px solid; border-radius: 6px; }
-.mode-public { background: var(--public-bg); border-color: var(--public); }
-.mode-restricted { background: var(--restricted-bg); border-color: var(--restricted); }
-
-/* ---- status and the named waits --------------------------------------------- */
-
-.status { min-height: 1.5em; margin: 0.75rem 0 0; }
-.status:empty { display: none; }
-.status[data-state="error"] {
-  color: var(--error);
-  background: var(--error-bg);
-  font-weight: 600;
-  padding: 0.5rem 0.75rem;
-  border-radius: 8px;
+.drop {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-height: 13rem;
+  padding: 1.75rem 1.25rem;
+  text-align: center;
+  background: var(--well);
+  border: 1.5px dashed var(--line-strong);
+  border-radius: 16px;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
 }
-.status[data-state="done"] { color: var(--done); font-weight: 600; }
-
-.steps { list-style: none; padding: 0; margin: 1rem 0 0; display: grid; gap: 0.75rem; }
-.steps li { display: grid; grid-template-columns: 1.25rem 1fr; column-gap: 0.5rem; align-items: center; }
-.steps li::before {
-  content: "";
-  grid-row: 1;
-  justify-self: center;
-  width: 0.8rem;
-  height: 0.8rem;
-  border: 2px solid var(--line);
+.drop:hover { border-color: var(--ink-2); }
+.drop-glyph {
+  display: grid;
+  place-items: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  margin-bottom: 0.5rem;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
   border-radius: 50%;
 }
-.steps li > :not(.step-name) { grid-column: 2; }
-.step-name { font-weight: 600; }
+.drop-glyph .icon { width: 1.5rem; height: 1.5rem; }
+.drop .icon-file { display: none; }
+#drop-empty { font-size: var(--t-value); }
+#drop-empty strong { text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 0.2em; }
+.drop[data-dragging] { border-style: solid; border-color: var(--ink); background: var(--surface); }
+.drop[data-chosen="yes"] { min-height: 10rem; border-style: solid; border-color: var(--line-strong); background: var(--surface); }
+.drop[data-chosen="yes"] .icon-upload { display: none; }
+.drop[data-chosen="yes"] .icon-file { display: block; }
+.drop[data-chosen="yes"] .drop-glyph { background: var(--well); }
+#drop-chosen { display: flex; flex-direction: column; align-items: center; gap: 0.1rem; max-width: 100%; }
+#chosen-name { font-size: var(--t-value); font-weight: 600; overflow-wrap: anywhere; }
+#chosen-size { font-variant-numeric: tabular-nums; }
+
+/* ---- which kind of link ------------------------------------------------------ */
+
+.mode {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  padding: 0.8rem 0.95rem;
+  border-radius: 10px;
+}
+.mode .icon { margin-top: 0.12rem; }
+.mode-public { background: var(--public-bg); }
+.mode-public .icon, .mode-public strong { color: var(--public); }
+.mode-restricted { background: var(--well); }
+.mode-restricted .icon, .mode-restricted strong { color: var(--ink); }
+
+#passphrase-length { color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* ---- status lines ------------------------------------------------------------ */
+
+.status { min-height: 1.5em; margin: 0.9rem 0 0; }
+.status:empty { display: none; }
+.status[data-state="busy"], .status[data-state="waiting"], .status[data-state="ready"],
+.status[data-state="done"], .status[data-state="error"] {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+.status[data-state="busy"], .status[data-state="waiting"], .status[data-state="ready"],
+.status[data-state="done"] { font-weight: 600; }
+.status[data-state="busy"] { color: var(--ink-2); font-weight: 400; }
+.status[data-state="done"] { color: var(--success); }
+/* A marker before the words, drawn here: the words are textContent. */
+.status[data-state]::before {
+  content: "";
+  flex: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  margin-top: 0.1rem;
+  border-radius: 50%;
+}
+.status[data-state=""]::before { display: none; }
+.status[data-state="busy"]::before {
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--success);
+  animation: spin 0.8s linear infinite;
+}
+.status[data-state="waiting"]::before, .status[data-state="ready"]::before { border: 2px solid var(--ink); }
+.status[data-state="ready"]::before { background: radial-gradient(circle, var(--ink) 0 35%, transparent 38%); }
+.status[data-state="done"]::before {
+  width: 0.45rem;
+  height: 0.85rem;
+  margin: 0.15rem 0.45rem 0 0.4rem;
+  border-radius: 0;
+  border: solid var(--success);
+  border-width: 0 2.5px 2.5px 0;
+  transform: rotate(45deg);
+}
+.status[data-state="error"] {
+  padding: 0.75rem 0.9rem;
+  color: var(--error);
+  background: var(--error-bg);
+  border-radius: 10px;
+  font-weight: 600;
+}
+.status[data-state="error"]::before {
+  content: "!";
+  display: grid;
+  place-items: center;
+  color: var(--error-bg);
+  background: var(--error);
+  font-size: 0.8rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+/* ---- the named waits: the page's centrepiece --------------------------------- */
+
+/* A timeline: each wait a marker on a line, hollow until it starts, marked as
+   it ends. Only the running wait shows its bar, and why it takes as long as
+   it does. */
+.steps {
+  list-style: none;
+  margin: 1.25rem 0 0;
+  padding: 1.25rem 1.25rem 0.25rem;
+  background: var(--well);
+  border-radius: 16px;
+}
+.steps li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.75rem 1fr;
+  column-gap: 0.9rem;
+  padding-bottom: 1.1rem;
+}
+.steps li > :not(.step-mark) { grid-column: 2; min-width: 0; }
+/* The line to the next step, drawn only when one is shown after it. */
+.steps li:has(~ li:not([hidden]))::before {
+  content: "";
+  position: absolute;
+  left: calc(0.875rem - 1px);
+  top: 1.95rem;
+  bottom: 0.2rem;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--line-strong);
+}
+.steps li[data-state="done"]:has(~ li:not([hidden]))::before { background: var(--success); }
+
+.step-mark {
+  grid-column: 1;
+  grid-row: 1 / span 4;
+  align-self: start;
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 2px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--on-ink);
+}
+.step-mark .icon { display: none; width: 1rem; height: 1rem; }
+.steps li[data-state="active"] .step-mark { border-color: var(--success); }
+.steps li[data-state="active"] .step-mark::after {
+  content: "";
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--success);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.steps li[data-state="done"] .step-mark { background: var(--success); border-color: var(--success); }
+.steps li[data-state="done"] .icon-done { display: block; }
+.steps li[data-state="error"] .step-mark { background: var(--error); border-color: var(--error); color: var(--paper); }
+.steps li[data-state="error"] .icon-error { display: block; }
+
+.step-name { align-self: center; min-height: 1.75rem; display: flex; align-items: center; font-weight: 500; color: var(--ink-2); }
 .steps li[data-state="pending"] .step-name { color: var(--muted); font-weight: 400; }
-.steps li[data-state="active"]::before { background: var(--accent); border-color: var(--accent); animation: pulse 1s ease-in-out infinite; }
-.steps li[data-state="done"]::before { background: var(--done); border-color: var(--done); }
-.steps li[data-state="error"]::before { background: var(--error); border-color: var(--error); }
-.steps li[data-state="pending"] progress { visibility: hidden; }
-.step-why { display: none; margin: 0.25rem 0; font-size: 0.9rem; color: var(--muted); }
+.steps li[data-state="active"] .step-name { color: var(--ink); font-weight: 650; font-size: var(--t-value); }
+
+.step-why { display: none; margin: 0.15rem 0 0.4rem; font-size: var(--t-small); color: var(--muted); max-width: 32rem; }
 .steps li[data-state="active"] .step-why { display: block; }
-.step-detail { font-size: 0.9rem; color: var(--muted); }
+
+.step-detail { font-size: var(--t-small); color: var(--muted); font-variant-numeric: tabular-nums; }
 .step-detail:empty { display: none; }
+.steps li[data-state="active"] .step-detail { color: var(--ink-2); }
+.steps li[data-state="error"] .step-detail { color: var(--error); font-weight: 600; }
+
+/* A bar only for the wait under way: done and waiting steps say it in words. */
+.steps li:not([data-state="active"]) progress { display: none; }
 
 progress {
   appearance: none;
+  display: block;
   width: 100%;
-  height: 0.5rem;
-  margin: 0.25rem 0;
+  height: 0.4rem;
+  margin: 0.45rem 0 0.35rem;
   border: 0;
   border-radius: 99px;
   background: var(--line);
-  color: var(--accent);
+  color: var(--success);
   overflow: hidden;
 }
 progress::-webkit-progress-bar { background: var(--line); border-radius: 99px; }
-progress::-webkit-progress-value { background: var(--accent); border-radius: 99px; }
-progress::-moz-progress-bar { background: var(--accent); border-radius: 99px; }
+progress::-webkit-progress-value { background: var(--success); border-radius: 99px; }
+progress::-moz-progress-bar { background: var(--success); border-radius: 99px; }
 
 /* A wait that cannot be measured. The stripe is painted by the main thread,
    so it moves only while the page is really running. */
 progress:indeterminate {
-  background: linear-gradient(90deg, var(--line) 0 35%, var(--accent) 35% 65%, var(--line) 65%) 0 0 / 300% 100%;
+  background: linear-gradient(90deg, var(--line) 0 35%, var(--success) 35% 65%, var(--line) 65%) 0 0 / 300% 100%;
   animation: slide 1.4s linear infinite;
 }
 progress:indeterminate::-webkit-progress-bar { background: transparent; }
 progress:indeterminate::-moz-progress-bar { background: transparent; }
 
-@keyframes pulse { 50% { transform: scale(0.6); opacity: 0.5; } }
+@keyframes pulse { 50% { transform: scale(0.55); opacity: 0.45; } }
 @keyframes slide { from { background-position: 100% 0; } to { background-position: 0 0; } }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 @media (prefers-reduced-motion: reduce) {
-  .steps li[data-state="active"]::before, progress:indeterminate { animation: none; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 
-/* ---- result ----------------------------------------------------------------- */
+/* ---- result ------------------------------------------------------------------ */
 
-#link { font-size: 0.95rem; }
+.result h2 { font-size: var(--t-title); }
+#link { font-family: var(--mono); font-size: 0.95rem; }
 #owner-token {
   display: block;
-  padding: 0.6rem 0.75rem;
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  padding: 0.65rem 0.8rem;
+  font-size: 0.95rem;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
   word-break: break-all;
 }
-.token-box { margin-top: 1rem; padding: 0.75rem; border: 2px solid var(--public); border-radius: 8px; background: var(--public-bg); }
+/* Weight, not colour: amber is taken, it means a public link. */
+.token-box {
+  margin-top: 1.5rem;
+  padding: 1rem 1.1rem;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+}
+.token-box > p:first-child { margin-top: 0; }
 
-/* ---- download --------------------------------------------------------------- */
+/* ---- download ---------------------------------------------------------------- */
+
+.receive { border-top: 0; padding-top: 0.5rem; }
+#unlock { margin-top: 1rem; }
+#unlock .field { margin-top: 0; }
 
 /* §8: the one server misbehaviour a recipient can see. Never subtle. */
 #expired-warning {
-  margin: 0 0 1rem;
-  padding: 0.75rem;
+  display: flex;
+  gap: 0.7rem;
+  margin: 0 0 1.5rem;
+  padding: 0.9rem 1rem;
   color: var(--error);
   background: var(--error-bg);
-  border: 3px solid var(--error);
-  border-radius: 8px;
+  border: 2px solid var(--error);
+  border-radius: var(--radius);
+  font-size: var(--t-value);
   font-weight: 700;
+  line-height: 1.4;
+}
+#expired-warning::before {
+  content: "!";
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  margin-top: 0.05rem;
+  border-radius: 50%;
+  color: var(--error-bg);
+  background: var(--error);
+  font-size: 0.9rem;
+  font-weight: 800;
 }
 
-.facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; margin: 0 0 1rem; }
-.facts dt { color: var(--muted); }
-.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.8rem 1.5rem; margin: 0 0 1.5rem; align-items: baseline; }
+.facts dt {
+  font-size: var(--t-label);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.facts dd { margin: 0; min-width: 0; font-size: var(--t-value); font-weight: 500; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+#file-name { font-weight: 650; }
 @media (max-width: 26rem) {
-  .facts { grid-template-columns: 1fr; gap: 0; }
-  .facts dd { margin-bottom: 0.5rem; }
+  .facts { grid-template-columns: 1fr; gap: 0.1rem; }
+  .facts dd { margin-bottom: 0.7rem; }
+}
+
+/* ---- the upload page's hero ------------------------------------------------- */
+
+/* The name and the tagline on the left, the photo beside them, never behind
+   them. Only on the upload page: the page shows #upload or #download by the
+   hidden attribute, so before the script decides, and on every download link,
+   the masthead stays quiet and the photo is never fetched. */
+body:has(> #upload:not([hidden])) .masthead {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(7rem, 34vw, 12rem);
+  align-items: center;
+  column-gap: 1.25rem;
+  padding-top: 2rem;
+  padding-bottom: 2.25rem;
+}
+body:has(> #upload:not([hidden])) .wordmark {
+  font-size: clamp(2.5rem, 4vw + 1.5rem, 5rem);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+body:has(> #upload:not([hidden])) .tagline {
+  margin-top: 0.75rem;
+  max-width: 24rem;
+  font-size: var(--t-value);
+  line-height: 1.45;
+}
+/* A CSS background, not an <img>: a hidden <img> would still be fetched on
+   every download link. WebP where the browser says it can take it. */
+body:has(> #upload:not([hidden])) .hero {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border-radius: var(--radius);
+  background-color: var(--well);
+  background-image: url("/assets/sunbird.jpg");
+  background-image: image-set(url("/assets/sunbird.webp") type("image/webp"), url("/assets/sunbird.jpg") type("image/jpeg"));
+  background-size: cover;
+  background-position: center;
+}
+
+/* ---- the upload page on a wide screen ----------------------------------------- */
+
+/* Two columns under a full-width hero. On the left, what is sent and who is
+   sending it (the file, the upload token); on the right, who can open it and
+   for how long, then the button that says which kind of link it makes, and
+   what follows. Below the breakpoint the columns are plain blocks, and the
+   page is one column in the same order. Every note stays visible. */
+@media (min-width: 60rem) {
+  body:has(> #upload:not([hidden])) .masthead,
+  #upload { max-width: var(--wide); }
+  body:has(> #upload:not([hidden])) .masthead {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    column-gap: 4rem;
+    padding-top: 4rem;
+    padding-bottom: 4rem;
+  }
+  body:has(> #upload:not([hidden])) .hero { border-radius: 16px; }
+  .columns {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    column-gap: 4rem;
+    align-items: start;
+  }
+  #upload .drop { min-height: 15rem; }
 }
