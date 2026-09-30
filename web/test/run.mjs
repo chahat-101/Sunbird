@@ -1,9 +1,6 @@
-// Runs web/test/crypto.html in a headless browser and exits non-zero on failure.
+// Runs web/test/crypto.html headless from file:// and fails if any test fails.
 //
 //   node web/test/run.mjs [firefox|chromium]
-//
-// No dependencies (see browser.mjs). The page loads from file://, exactly as a
-// person opening it would.
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { launch, sleep } from './browser.mjs';

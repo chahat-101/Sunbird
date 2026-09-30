@@ -1,11 +1,6 @@
-// The page's hash-wasm: `hashwasm.argon2id`, taking the same arguments and
-// returning the same bytes, computed in a Web Worker (argon2-worker.js).
-// crypto.js calls it exactly as it calls hash-wasm itself, so the parameters
-// stay in crypto.js, and web/test/crypto.html still runs the real library on
-// its own thread, known answers included.
-//
-// The page loads this instead of the library. hash-wasm on the main thread
-// would compute Argon2id there and freeze the tab while it does.
+// A drop-in `hashwasm.argon2id` that runs in a Worker (argon2-worker.js), so
+// the tab doesn't freeze. crypto.js calls it just like hash-wasm, so the
+// parameters stay in crypto.js.
 (function (global) {
   'use strict';
 

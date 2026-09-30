@@ -1,17 +1,11 @@
-// End to end: builds the server with cargo, runs it on a free port over an
-// empty data directory, and drives the real page in a headless browser. Upload
-// through the form, open the link, download — and what a broken or hostile
-// server can do in between, by editing the stored blob on disk.
+// End-to-end tests: build the server, run it on an empty data directory, and
+// drive the real page in a headless browser. Covers upload, open, download,
+// and what a hostile server can do by editing blobs on disk.
 //
 //   node web/test/e2e.mjs [firefox|chromium] [--phone]
 //
-// Needs `cargo` on PATH, and a browser as for run.mjs. --phone runs every test
-// in a 390×844 window; the layout test uses one either way.
-//
-// This harness was written for the Go server this project replaces, and is
-// kept as the conformance test for the rewrite. Apart from the project's name,
-// the one line changed is the build step, near the end: `cargo build` in place
-// of `go build`. No test was changed to suit the Rust server.
+// --phone runs everything at 390×844. Written for the old Go server and kept
+// as the conformance test; only the build line changed.
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -72,8 +66,8 @@ function freePort() {
   });
 }
 
-// Installed into the page after each navigation. Records what the page would
-// save instead of saving it, records upload URLs, and can skew the page's clock.
+// Added to the page after each load: captures would-be saves and upload URLs,
+// and can skew the clock.
 function pageLib() {
   const pattern = (n, seed) => {
     const u = new Uint8Array(n);
@@ -123,11 +117,8 @@ function pageLib() {
   return true;
 }
 
-// Installed before any of the page's own scripts, in every page: counts calls
-// into Argon2id, and how long the main thread stalled during each; records
-// each request the page makes, and every phase a status line passes through.
-// pageLib is installed after the load, too late for a public link, which
-// opens at once.
+// Added before the page's own scripts: counts Argon2id calls and main-thread
+// stalls, and records every request and status change.
 function probe() {
   const seen = { argon2id: 0, requests: [], stretches: [] };
   window.__probe = seen;
@@ -143,8 +134,7 @@ function probe() {
     return realOpen.call(this, method, url, ...rest);
   };
 
-  // Each record holds the value before a change, so the values a status took
-  // are every old value after the first, then the current one.
+  // Each record holds the value before a change.
   const log = [];
   const phases = new MutationObserver((records) => { for (const r of records) log.push([r.target.id, r.oldValue]); });
   phases.observe(document, { subtree: true, attributes: true, attributeFilter: ['data-phase'], attributeOldValue: true });
@@ -162,9 +152,8 @@ function probe() {
     }).observe(document, { childList: true, subtree: true });
   }
 
-  // The page's hashwasm has loaded by then, and nothing reaches Argon2id before
-  // the load. A timer ticks every 10 ms during each call: a main thread doing
-  // the work would miss every tick until it finished.
+  // A 10 ms timer runs during each Argon2id call; if the main thread did the
+  // work, it would miss every tick.
   document.addEventListener('DOMContentLoaded', () => {
     const real = window.hashwasm && window.hashwasm.argon2id;
     if (typeof real !== 'function') return;
@@ -218,8 +207,7 @@ async function waitState(id, states, timeout = 60_000) {
   }
 }
 
-// `expiry` and `downloads` are the form's option values; `skew` moves the
-// page's clock by that many seconds before the upload.
+// `expiry` and `downloads` are form values; `skew` shifts the page's clock.
 async function uploadViaForm({ name, type, size, seed, passphrase, expiry, downloads, skew, token = TOKEN, origin = base }) {
   await go(`${origin}/`);
   const kept = await inPage((name, type, size, seed, passphrase, expiry, downloads, skew, token) => {
@@ -248,9 +236,8 @@ async function uploadViaForm({ name, type, size, seed, passphrase, expiry, downl
   return { status, kept, ...result };
 }
 
-// Uploads bytes built in the page by hand, bypassing the form, with limits an
-// hour ahead and no download limit. `build` is inlined into the evaluated
-// expression: the page's CSP forbids eval.
+// Uploads hand-built bytes, bypassing the form. `build` is inlined because
+// the CSP forbids eval.
 async function uploadRaw(build) {
   await go(`${base}/`);
   return b.evaluate(`(async () => {
@@ -488,8 +475,7 @@ test('one path (D4): same requests in both modes; Argon2id only with a passphras
   eq(JSON.stringify(res.beforePrompt), '["download-restricted","unlock"]', 'restricted: shown while the prompt waits');
 });
 
-// The step 01 test (crypto.html, "round trip: restricted mode") and step 04's
-// metadata AAD test cover this in crypto.js; this is the same attack on the page.
+// crypto.html covers this attack in crypto.js; this runs it through the page.
 test('server clears flags bit 0 on a restricted file: nothing is asked, the file does not open, nothing saved', async () => {
   const up = await uploadViaForm({ name: 'r.txt', type: 'text/plain', size: 2000, seed: 14, passphrase: 'secret' });
   eq(up.status.state, 'done', `upload: ${up.status.text}`);
@@ -517,9 +503,8 @@ async function publicReady(size, seed) {
   return { id, path: blobPath(id), link: up.link };
 }
 
-// Growing the blob on disk would not do: the server sends as many bytes as its
-// row records. So the grown blob is uploaded as a second file, and the page's
-// download of the first is sent to it — both real server responses.
+// The server only sends as many bytes as its row says, so the grown blob is
+// uploaded as a second file and the download is redirected to it.
 test('slot grown between preview and download: records start after the downloaded slot', async () => {
   const size = 70000;
   const { id, path } = await publicReady(size, 3);
@@ -558,10 +543,8 @@ test('a flipped byte in the last record: rejected as corrupted, nothing saved', 
   eq((await inPage(() => T.saved())).length, 0, 'files saved');
 });
 
-// The server refuses expired files, so the §8 warning is reachable only through
-// a skewed clock (or a server ignoring expiry). The file is live by the
-// server's clock; the recipient's clock is two hours fast. The passphrase
-// prompt holds the page until the clock is skewed.
+// The server refuses expired files, so the §8 warning needs a skewed clock:
+// the recipient's clock is two hours fast.
 test('past expires_at by the recipient\'s clock (§8): warns prominently and still downloads', async () => {
   const up = await uploadViaForm({ name: 'late.txt', type: 'text/plain', size: 1000, seed: 9, passphrase: 'p', expiry: '3600', downloads: '0' });
   eq(up.status.state, 'done', `upload: ${up.status.text}`);
@@ -1009,8 +992,8 @@ test('phone (390×844): nothing scrolls sideways and every control is a 44 px ta
         if (r.right > width + 0.5) problems.push(`${where}: #${el.id} runs to ${Math.round(r.right)} px`);
         if (el.matches('button, input, select') && r.height < 44) problems.push(`${where}: #${el.id || target.id} is ${Math.round(r.height)} px tall`);
       }
-      // A style that sets `display` overrides the hidden attribute: a mode
-      // explanation or a step the page hid would still show.
+      // A `display` rule would override `hidden` and show things that should be
+      // hidden.
       for (const el of document.querySelectorAll('[hidden]')) {
         if (el.getClientRects().length > 0) problems.push(`${where}: hidden ${el.id ? `#${el.id}` : el.dataset.step || el.tagName} is displayed`);
       }

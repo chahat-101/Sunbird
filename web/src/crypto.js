@@ -1,17 +1,10 @@
-// Sunbird crypto core — protocol.md §2, §3.1, §4, §5, §6, §7.
+// Sunbird's crypto (protocol.md §2–§7). Defines the global SunbirdCrypto.
 //
-// A classic script, not an ES module: module scripts do not load from file://,
-// and web/test/crypto.html must run by opening the file. Defines one global,
-// SunbirdCrypto. Requires hash-wasm's argon2 build (global `hashwasm`) loaded
-// first, and WebCrypto.
+// A plain script, not a module, so web/test/crypto.html works from file://.
+// Needs hash-wasm's argon2 (global `hashwasm`) loaded first.
 //
-// Errors a caller must tell apart carry `code`: 'wrong-passphrase',
-// 'needs-newer-version', 'unknown-version', 'malformed', 'too-many-records',
-// 'too-large', 'truncated', 'corrupt', 'size-mismatch', 'name-too-long',
-// 'empty-passphrase'.
-//
-// Every header offset lives in this file. Callers get the header's pieces from
-// parseHeader and never compute where the slot ends or the records begin.
+// Errors callers need to tell apart carry a `code`. All header offsets live
+// here; callers use parseHeader rather than computing them.
 (function (global) {
   'use strict';
 
@@ -39,9 +32,8 @@
   const METADATA_PLAINTEXT_LEN = 512;
   const MAX_METADATA_JSON_LEN = METADATA_PLAINTEXT_LEN - 2; // 510
 
-  // §4.1 — fixed for version 0x01, never read from the header.
-  // hash-wasm has no version option; it implements Argon2 v1.3 (0x13) only.
-  // The known-answer test in web/test/crypto.html pins that.
+  // §4.1: fixed for version 0x01, never read from the header. hash-wasm only
+  // implements Argon2 v1.3; the known-answer test in crypto.html pins it.
   const ARGON2ID = {
     iterations: 3,      // t
     memorySize: 65536,  // m, in KiB (64 MiB)
@@ -113,9 +105,8 @@
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
 
-  // §2: exactly 22 base64url characters, no padding, and the trailing 4 bits
-  // of the 22nd character zero. Re-encoding and comparing checks the last
-  // rule: the encoder always writes those bits as zero.
+  // §2: exactly 22 base64url characters with the last 4 bits zero. Re-encoding
+  // and comparing checks those bits.
   function decodeFragment(fragment) {
     if (typeof fragment !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(fragment)) {
       throw failure('malformed', 'Link secret is malformed: expected 22 base64url characters');
@@ -149,8 +140,8 @@
 
   // ---- §4.2 Keying material -------------------------------------------------
 
-  // One function, one branch on the flag (D4). `passphrase` is required when
-  // flags bit 0 is set and must be absent otherwise.
+  // One code path for both modes (D4). A passphrase is required only when the
+  // flag is set.
   async function deriveIkm(flags, fragmentSecret, salt, passphrase) {
     if (!Number.isInteger(flags) || flags < 0 || flags > 0xff) {
       throw new Error('flags must be a byte');
@@ -221,8 +212,8 @@
     return entry;
   }
 
-  // One complete type-0x01 entry → file_key, or throws. Not exported: only
-  // unwrapSlot calls it, so no caller can stop at the first failure.
+  // Unwrap one type-0x01 entry. Private, so callers always go through
+  // unwrapSlot and try every entry.
   async function unwrapFileKey(wrappingKey, entry) {
     if (entry.length !== ENTRY_FRAGMENT_LEN ||
         ((entry[1] << 8) | entry[2]) !== ENTRY_FRAGMENT_BODY_LEN) {
@@ -235,9 +226,8 @@
     ));
   }
 
-  // The one place slot entries are framed (§3.1, §5). `bytes` starts at the
-  // slot and holds at most what may belong to the header. Returns the entries
-  // and the slot's length; throws 'malformed' on any bound.
+  // The only place slot entries are framed (§3.1, §5). Throws 'malformed' on
+  // any bound.
   function frameSlot(bytes) {
     const pastEnd = (end) => failure('malformed', HEADER_CORE_LEN + end > MAX_HEADER_LEN
       ? 'Header is larger than 8 KiB'
@@ -258,9 +248,7 @@
     return { entries, length: offset };
   }
 
-  // Takes the whole slot, exactly — entry_count ‖ entries, nothing after, as
-  // parseHeader returns it — and returns file_key from the first entry that
-  // unwraps.
+  // Returns file_key from the first entry that unwraps.
   async function unwrapSlot(wrappingKey, slot) {
     if (!(slot instanceof Uint8Array)) throw new Error('slot must be a Uint8Array');
     if (slot.length > MAX_HEADER_LEN - HEADER_CORE_LEN) {
@@ -271,8 +259,7 @@
     const { entries, length } = frameSlot(slot);
     if (length !== slot.length) throw failure('malformed', 'Bytes follow the last slot entry');
 
-    // Try every entry of a known type, in order, continuing past failures.
-    // An unknown type is skipped by its length alone.
+    // Try every known entry in order; skip unknown types by their length.
     let triedKnown = false;
     for (const entry of entries) {
       if (entry[0] !== ENTRY_FRAGMENT) continue;
@@ -280,8 +267,7 @@
       try {
         return await unwrapFileKey(wrappingKey, entry);
       } catch (_) {
-        // Includes a 0x01 whose length is not 60. Rejecting the slot would
-        // buy nothing a server can't get by deleting the blob (§5).
+        // Keep going. Rejecting the whole slot gains nothing (§5).
       }
     }
     if (triedKnown) throw failure('wrong-passphrase', 'Wrong passphrase or damaged link.');
@@ -292,15 +278,10 @@
 
   const UNKNOWN_VERSION = 'This link was created by a newer version of Sunbird. Update your client.';
 
-  // `bytes` is the preview from GET /api/meta/:id — the first min(8192,
-  // blob_size) bytes — or the whole downloaded blob. Bytes past the header are
-  // ignored. Checks every bound in §3.1 and returns copies of the header's
-  // pieces; `slot` is exactly the slot, ready for unwrapSlot, and the records
-  // begin at `headerLength`.
-  //
-  // Nothing returned here is verified yet. flags, expiresAt and maxDownloads
-  // are what the server sent until decryptMetadata succeeds over headerCore.
-  // expiresAt is a BigInt: it is a u64, and a Number would round it silently.
+  // Parses the preview (from /api/meta) or a whole blob, checking the bounds
+  // in §3.1. Nothing here is verified yet: flags and limits are just what the
+  // server sent until decryptMetadata succeeds. expiresAt is a BigInt so a
+  // u64 isn't silently rounded.
   function parseHeader(bytes) {
     if (!(bytes instanceof Uint8Array)) throw new Error('header bytes must be a Uint8Array');
     if (bytes.length === 0) throw failure('malformed', 'Header is empty');
@@ -337,8 +318,7 @@
 
   // metadata_key = HKDF(file_key, "sunbird/v1/metadata", 32)
   // metadata_iv  = HKDF(file_key, "sunbird/v1/metadata-nonce", 12)
-  // Derived from file_key only: never the wrapping key, never random-and-stored,
-  // never a constant. Each file_key encrypts exactly one metadata message.
+  // From file_key only. Each file_key encrypts exactly one metadata message.
   async function deriveMetadataKeys(fileKey, salt) {
     requireBytes(fileKey, FILE_KEY_LEN, 'file_key');
     const raw = await hkdf(fileKey, salt, INFO_METADATA, 32);
@@ -348,8 +328,7 @@
     };
   }
 
-  // plaintext = I2OSP(len(json), 2) ‖ json ‖ zero fill to 512. Never truncates:
-  // details whose JSON exceeds 510 UTF-8 bytes are refused.
+  // len(json) as 2 bytes ‖ json ‖ zeros to 512. Too long is refused, never cut.
   function encodeMetadata({ name, type, size }) {
     if (typeof name !== 'string' || typeof type !== 'string') throw new Error('name and type must be strings');
     if (!Number.isSafeInteger(size) || size < 0) throw new Error('size must be a non-negative integer');
@@ -368,8 +347,7 @@
     return plaintext;
   }
 
-  // header_prefix (30 bytes) supplies the salt and is the AAD, so the limits it
-  // carries are sealed with the metadata. Returns metadata_ct (528 bytes).
+  // header_prefix is the AAD, so the limits are sealed with the metadata.
   async function encryptMetadata(fileKey, headerPrefix, fields) {
     requireBytes(headerPrefix, HEADER_PREFIX_LEN, 'header_prefix');
     if (headerPrefix[0] !== VERSION) throw new Error('header_prefix is not version 0x01');
@@ -383,16 +361,12 @@
     ));
   }
 
-  // Decrypts the metadata in header_core. Success also verifies header_prefix:
-  // version, flags, salt, expires_at and max_downloads are what the uploader
-  // set (§7, §8).
+  // Decrypting also proves the flags and limits are what the uploader set
+  // (§7, §8). Returns { name, type, size } only.
   //
-  // Returns a frozen { name, type, size } and nothing else; unknown JSON keys
-  // are dropped. name and type are HOSTILE INPUT: the uploader chose them, and
-  // anyone can upload and send a link. Render them as text (textContent),
-  // never as markup (innerHTML, attribute or URL building), and never let
-  // `type` decide how anything is displayed. Doing either is stored XSS on the
-  // origin that holds the keys (DECISIONS.md D7).
+  // name and type are HOSTILE: anyone can upload a file and send the link.
+  // Show them with textContent only, and never let `type` decide anything.
+  // Otherwise it's stored XSS on the page that holds the keys (D7).
   async function decryptMetadata(fileKey, headerCore) {
     requireHeaderCore(headerCore);
     const headerPrefix = headerCore.subarray(0, HEADER_PREFIX_LEN);
@@ -461,17 +435,15 @@
     return { contentKey, nonceBase, headerHash };
   }
 
-  // header_core (558 bytes) supplies the salt and the AAD binding, so the two
-  // cannot come from different headers. Returns record_0 ‖ … ‖ record_{n-1}.
-  // `onProgress`, if given, gets { stage: 'records', done, total } after each
-  // record: counts only, for a progress bar. It must not throw.
+  // Salt and AAD both come from header_core, so they can't come from different
+  // headers. onProgress gets { stage, done, total } after each record.
   async function encryptRecords(fileKey, headerCore, plaintext, onProgress) {
     if (!(plaintext instanceof Uint8Array)) throw new Error('plaintext must be a Uint8Array');
     if (plaintext.length > MAX_PLAINTEXT) throw failure('too-large', 'File is larger than 100 MiB');
     const { contentKey, nonceBase, headerHash } = await recordContext(fileKey, headerCore);
 
-    // Every non-final record holds exactly 65519 bytes; a 0-byte file is one
-    // record holding only the final delimiter.
+    // Full records hold 65519 bytes; an empty file is one record with just
+    // the final delimiter.
     const n = plaintext.length === 0 ? 1 : Math.ceil(plaintext.length / RECORD_DATA_LEN);
     const finalDataLen = plaintext.length - (n - 1) * RECORD_DATA_LEN;
     const out = new Uint8Array((n - 1) * RECORD_LEN + finalDataLen + MIN_RECORD_LEN);
@@ -494,17 +466,11 @@
     return out;
   }
 
-  // §6.5. `body` is the blob from parseHeader's `headerLength` on. Returns the
-  // plaintext only once every record has authenticated, the final delimiter
-  // was seen and the length matches; otherwise throws.
+  // §6.5. Returns the plaintext only when every record authenticates, the
+  // final delimiter is present and the size matches.
   //
-  // `expectedSize` MUST be the `size` from decryptMetadata over this same
-  // headerCore. Never a length from the server — a Content-Length, a database
-  // row, a JSON field: step 6 compares two values from inside the AEAD, and
-  // one the server supplies turns it into a check the server can pass.
-  //
-  // `onProgress` is as for encryptRecords. A count reported is a record that
-  // authenticated, not plaintext anyone may use yet.
+  // `expectedSize` MUST come from decryptMetadata, never from the server
+  // (Content-Length, JSON, anything). Otherwise the server could pass the check.
   async function decryptRecords(fileKey, headerCore, body, expectedSize, onProgress) {
     if (!(body instanceof Uint8Array)) throw new Error('body must be a Uint8Array');
     if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) {
@@ -570,17 +536,12 @@
     return prefix;
   }
 
-  // Upload, §10 steps 1–7. A `passphrase` string sets flags bit 0; leaving it
-  // undefined is public mode. `expiresAt` is absolute Unix seconds (Number or
-  // BigInt). `maxDownloads` 0 means no download limit, not zero downloads.
-  // Returns { fragment, blob }: the link fragment and the bytes to upload.
-  // `onProgress`, if given, is told each wait as it starts, so a page can say
-  // what is slow: { stage: 'passphrase' } before Argon2id (restricted only),
-  // then { stage: 'records', done, total } as records are sealed.
+  // Upload, §10 steps 1–7. No passphrase means a public link. maxDownloads 0
+  // means no limit. Returns { fragment, blob }. onProgress hears
+  // { stage: 'passphrase' } before Argon2id, then record counts.
   async function encryptFile(plaintext, { name, type, passphrase, expiresAt, maxDownloads, onProgress }) {
     if (!(plaintext instanceof Uint8Array)) throw new Error('plaintext must be a Uint8Array');
-    // Every refusal that needs no work comes before any: the size (§6.4), an
-    // empty passphrase (§4.1), a name too long (§7) — not after seconds of Argon2id.
+    // Refuse bad input before spending seconds on Argon2id.
     if (plaintext.length > MAX_PLAINTEXT) throw failure('too-large', 'File is larger than 100 MiB');
     const restricted = passphrase !== undefined;
     if (restricted && (typeof passphrase !== 'string' || passphrase === '')) {
@@ -619,8 +580,7 @@
     };
   }
 
-  // Download, §10 steps 3–4. `header` is parseHeader's result for the preview.
-  // The passphrase is used only if flags bit 0 is set. Returns file_key.
+  // Download, §10 steps 3–4. Returns file_key.
   async function unlockFile(header, fragmentSecret, passphrase) {
     const restricted = (header.flags & FLAG_PASSPHRASE) !== 0;
     if (restricted && (typeof passphrase !== 'string' || passphrase === '')) {
@@ -630,13 +590,9 @@
     return unwrapSlot(await deriveWrappingKey(ikm, header.salt), header.slot);
   }
 
-  // Download, §10 step 6. `preview` is parseHeader's result for the preview
-  // bytes and `blob` the whole downloaded blob. Returns { metadata, plaintext }
-  // only after every check in §6.5 and §7 has passed.
-  //
-  // The size the records are checked against is decrypted here, from the
-  // downloaded header, so no caller supplies a length — least of all the server's.
-  // `onProgress` is as for decryptRecords.
+  // Download, §10 step 6. Returns { metadata, plaintext } only after every
+  // check in §6.5 and §7 passes. The expected size is decrypted here, so no
+  // caller (and never the server) supplies it.
   async function decryptFile(fileKey, preview, blob, onProgress) {
     if (!(blob instanceof Uint8Array)) throw new Error('blob must be a Uint8Array');
     requireBytes(preview.headerCore, HEADER_CORE_LEN, 'preview header_core');

@@ -10,15 +10,12 @@ use hyper::header::HeaderValue;
 
 use crate::config::Rate;
 
-/// At most `requests` in any `seconds`, per key, refilled evenly: one more
-/// request's worth every seconds / requests. Kept as each key's next due time
-/// (GCRA), one Instant per key, so a burst never needs a list of timestamps.
-/// A refused request uses up nothing.
+/// At most `requests` per `seconds` per key, refilled evenly (GCRA). Stores one
+/// due time per key, and a refused request costs nothing.
 pub struct Limiter<K> {
     /// One request's share of the window.
     every: Duration,
-    /// How far ahead of now a key's due time may run: the window less one
-    /// share, which is what allows a full burst of `requests`.
+    /// How far ahead a key's due time may run: enough for a full burst.
     burst: Duration,
     due: Mutex<HashMap<K, Instant>>,
 }
@@ -51,9 +48,7 @@ impl<K: Eq + Hash> Limiter<K> {
         Ok(())
     }
 
-    /// Drops keys that are back to a full allowance, which is the same as
-    /// never having been seen. The sweeper calls it, so the table holds only
-    /// the keys active within one window.
+    /// Forgets keys that are back to a full allowance. The sweeper calls it.
     pub fn forget_idle(&self) {
         let now = Instant::now();
         self.due
@@ -63,16 +58,12 @@ impl<K: Eq + Hash> Limiter<K> {
     }
 }
 
-/// The client a request came from. With no trusted proxies, the socket
-/// address, and X-Forwarded-For is ignored: any client can write it. With
-/// some, the header is walked right to left, starting from the socket
-/// address, for as long as the hop being looked at is a trusted proxy; the
-/// first address that is not one is the client. Each trusted proxy appends
-/// the address it was connected from, so everything to the right of the first
-/// untrusted hop was written by a proxy that is trusted, and everything to its
-/// left may be forged. Entry 0 is whatever the client chose to send.
+/// The real client address. With no trusted proxies, the socket address;
+/// X-Forwarded-For is ignored, since anyone can write it. Otherwise, walk the
+/// header right to left while each hop is a trusted proxy; the first untrusted
+/// hop is the client. Anything further left may be forged.
 ///
-/// An entry that is not an address stops the walk at the hop that wrote it.
+/// An entry that isn't an address stops the walk there.
 pub fn client<'a>(
     peer: IpAddr,
     forwarded: impl Iterator<Item = &'a HeaderValue>,
@@ -96,10 +87,8 @@ pub fn client<'a>(
     client
 }
 
-/// The key a client is throttled under. An IPv6 /64 is one customer, who
-/// can use any of its 2^64 addresses, so it is one bucket. An IPv4 address
-/// written as IPv6 (::ffff:a.b.c.d) is the IPv4 address: all of IPv4 sits
-/// in one /64 of that form, and would otherwise share one bucket.
+/// The rate-limit key. An IPv6 /64 is one customer, so one bucket. IPv4 written
+/// as IPv6 (::ffff:a.b.c.d) counts as the IPv4 address.
 pub fn bucket(address: IpAddr) -> IpAddr {
     match address.to_canonical() {
         IpAddr::V6(v6) => {
@@ -143,8 +132,8 @@ mod tests {
         );
     }
 
-    /// With one trusted proxy, the client is the rightmost entry the proxy did
-    /// not write itself; a request straight from a client is its own address.
+    /// With one trusted proxy, the client is the entry just left of it; a direct
+    /// request is its own address.
     #[test]
     fn one_trusted_proxy() {
         let proxy = ["10.0.0.1"];
@@ -161,9 +150,7 @@ mod tests {
         assert_eq!(client_of("10.0.0.1", &[], &proxy), ip("10.0.0.1"));
     }
 
-    /// A client that sends its own X-Forwarded-For, however long, cannot move
-    /// the answer: the proxy appended the real address to the right of it. Not
-    /// even entries naming the trusted proxy itself help.
+    /// A client's own X-Forwarded-For, however long, can't change the answer.
     #[test]
     fn forged_chains_cannot_move_the_client() {
         let proxy = ["10.0.0.1"];
@@ -191,8 +178,7 @@ mod tests {
             client_of("10.0.0.2", &["6.6.6.6, 198.51.100.7, 10.0.0.1"], &chain),
             real
         );
-        // Garbage written by the trusted hop stops the walk there: the proxy,
-        // not a forged address.
+        // Garbage from the trusted hop stops the walk at the proxy.
         assert_eq!(
             client_of("10.0.0.1", &["6.6.6.6, garbage"], &proxy),
             ip("10.0.0.1")

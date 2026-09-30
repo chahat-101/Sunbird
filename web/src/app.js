@@ -1,40 +1,30 @@
-// Sunbird client — the page for protocol.md §10. `/` uploads a file and
-// shows a link; `/d/<id>#<fragment>` opens one and downloads the file. All
-// cryptography and every header offset are in crypto.js, and Argon2id runs in
-// a Worker (argon2.js). This file moves bytes and sets text.
+// The Sunbird page (protocol.md §10). `/` uploads, `/d/<id>#<key>` downloads.
+// The crypto lives in crypto.js; this file moves bytes and sets text.
 //
-// Rules a change to this page keeps:
-// - Decrypted metadata is hostile input. It is only ever set with textContent;
-//   `type` is never read; the file is never previewed, only saved, as
-//   application/octet-stream, with path separators stripped from its name.
-// - A file dropped anywhere on the page is caught, never opened by the browser.
-// - Which kind of link a file gets is said before anything commits to it: by
-//   the box, on the button that uploads, beside the link, and on opening,
-//   before any prompt.
-// - Each wait is its own named step with its own bar; a refusal says what
-//   actually went wrong.
+// Rules to keep:
+// - Decrypted metadata is hostile. Use textContent only, ignore `type`, never
+//   preview the file, save it as application/octet-stream with no path
+//   separators in its name.
+// - Catch drops anywhere, so the browser never opens a dropped file.
+// - Say whether a link is public before anything is committed.
+// - Every wait is a named step, and every error says what really went wrong.
 (function () {
   'use strict';
   const C = SunbirdCrypto;
 
-  const MAX_PLAINTEXT = 104857600; // §6.4: the cap is on plaintext, not max_blob
-  // D9 policy, not format: expiry defaults to 24 hours, at most 7 days; the
-  // download limit defaults to 1. 0 is "no limit" and is labelled so.
+  const MAX_PLAINTEXT = 104857600; // §6.4: the cap is on plaintext
   const MAX_LIFETIME = 7 * 24 * 3600;
-  // The server refuses an expires_at more than 7 days after its own clock. The
-  // 7-day choice asks for 300 s less, so a device clock a few minutes fast (a
-  // laptop just woken, before NTP) is not refused. A courtesy, not a limit:
-  // the server's bound is exact whatever the client does (§10).
+  // Ask for 5 minutes under 7 days, so a slightly fast clock isn't refused.
   const CLOCK_MARGIN = 300;
   const DOWNLOAD_LIMITS = new Set([0, 1, 5, 10]);
   const ID_PATTERN = /^[A-Za-z0-9_-]{16}$/;
   const TOKEN_KEY = 'sunbird.uploadToken';
 
-  // Expired, used up, deleted and never existed are one answer from the server.
+  // The server gives one answer for expired, used up, deleted or never existed.
   const NO_FILE = 'There is no file at this link: it expired, was deleted, or the link is wrong.';
   const BAD_TOKEN = 'The server did not accept this upload token. Check it, or ask the admin whether it is still valid.';
   const TOO_LARGE = 'This file is larger than 100 MiB, the most Sunbird can send.';
-  // The server's words for a blob over max_blob; any other 413 is a member's quota.
+  // The server's 413 wording for "too big"; any other 413 is a quota.
   const SERVER_TOO_LARGE = 'upload is larger than the server accepts';
 
   const $ = (id) => document.getElementById(id);
@@ -45,9 +35,7 @@
     return err;
   }
 
-  // `state` is busy, waiting, ready, done or error. `phase` names the wait
-  // (read, stretch, encrypt, upload, meta, open, download, decrypt), and is
-  // the state itself when there is no wait.
+  // `state`: busy, waiting, ready, done or error. `phase` names the wait, if any.
   function setStatus(el, state, text, phase) {
     el.dataset.state = state;
     el.dataset.phase = phase || state;
@@ -68,7 +56,7 @@
 
   const percent = (done, total) => `${Math.floor((100 * done) / total)}%`;
 
-  // What actually went wrong, in words a person can act on.
+  // The real cause, in words a person can act on.
   function explain(err, restricted) {
     switch (err && err.code) {
       case 'wrong-passphrase':
@@ -85,7 +73,7 @@
       case 'too-many-records':
       case 'size-mismatch':
         return `The file is corrupted or was altered, so nothing was saved. ${err.message}.`;
-      // Written for people where they are raised.
+      // Already written for people.
       case 'needs-newer-version': // §5
       case 'unknown-version':     // §9, verbatim
       case 'name-too-long':
@@ -105,8 +93,8 @@
     }
   }
 
-  // A refusal from the server, as the error to show. `during` is 'upload' or
-  // 'download': the rate limits and the 413 mean different things for each.
+  // Turn a server refusal into a message. 429 and 413 mean different things
+  // for uploads and downloads.
   function refusal(status, reason, retryAfter, during) {
     const said = typeof reason === 'string' ? reason.trim() : '';
     const sentence = /[.!?]$/.test(said) ? said : `${said}.`;
@@ -116,7 +104,6 @@
       case 404:
         return coded('gone', NO_FILE);
       case 413:
-        // The server's quota messages name the limit and when it frees (step 07).
         return said === SERVER_TOO_LARGE || !said || during !== 'upload'
           ? coded('too-large', TOO_LARGE)
           : coded('quota', `Over your upload quota. ${sentence}`);
@@ -128,7 +115,6 @@
           : `This network has made too many requests to the server in a short time, so it is refusing them for now. ${when}`);
       }
       case 507:
-        // The disk is at its free-space floor: nothing the member changes helps.
         return coded('server', 'The server is running out of disk space, so it is not accepting uploads right now. Nothing was stored. Tell the server\'s admin.');
       case 400:
         if (during === 'upload' && said) return coded('refused', `The server refused this upload: ${sentence}`);
@@ -138,8 +124,7 @@
     }
   }
 
-  // A list of named waits. Each bar measures only its own wait; a wait with
-  // nothing to measure animates, and counts the seconds so far.
+  // The named steps. A step with nothing to measure counts seconds instead.
   function steps(list) {
     const items = new Map(Array.from(list.querySelectorAll('li[data-step]'), (li) => [li.dataset.step, li]));
     let ticker = null;
@@ -203,9 +188,8 @@
     };
   }
 
-  // A file dropped where no page handles it is opened by the browser, in this
-  // tab: shown, and the page left. So every drop anywhere is caught. On the
-  // upload page it chooses the file; elsewhere it does nothing.
+  // Otherwise the browser opens a dropped file in this tab. On the upload page
+  // a drop chooses the file; elsewhere it's ignored.
   function catchDrops(onFiles) {
     const zone = $('drop-zone');
     window.addEventListener('dragover', (event) => {
@@ -224,8 +208,7 @@
     });
   }
 
-  // Clipboard access can be missing or refused (an http:// page, a browser
-  // setting). Then the text is selected for the device's own copy command.
+  // If the clipboard is unavailable, select the text so the user can copy it.
   async function copy(source, note) {
     const text = source instanceof HTMLInputElement ? source.value : source.textContent;
     try {
@@ -243,8 +226,7 @@
   const STRETCH_DETAIL = 'This page is still working: ';
   let uploading = false;
 
-  // Remembering the token is a convenience. Storage can be missing or throw
-  // (private windows, blocked site data); then the field simply starts empty.
+  // Storage can throw (private windows); then the field just starts empty.
   function rememberedToken() {
     try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (_) { return ''; }
   }
@@ -291,13 +273,11 @@
 
     const protect = $('protect');
     const passphrase = $('passphrase');
-    // A length, and no rule about what the passphrase must contain.
     const count = () => {
       const n = Array.from(passphrase.value.normalize('NFC')).length;
       $('passphrase-length').textContent = `${n} character${n === 1 ? '' : 's'}`;
     };
-    // The field, the explanation of the mode and the button's words follow
-    // the box, including the state a browser may restore it to on reload.
+    // Follow the checkbox, including a state the browser restored on reload.
     const follow = () => {
       passphrase.disabled = !protect.checked;
       if (!protect.checked) passphrase.value = '';
@@ -318,7 +298,7 @@
     $('copy-token').addEventListener('click', () => copy($('owner-token'), $('copy-token-status')));
   }
 
-  // XMLHttpRequest, not fetch: only it reports upload progress in every browser.
+  // XHR, not fetch: only XHR reports upload progress everywhere.
   function post(url, body, token, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -348,7 +328,7 @@
     const button = $('upload-button');
     $('result').hidden = true;
 
-    // Every refusal that needs no work comes before any, synchronously.
+    // Refuse bad input before doing any work.
     const file = $('file').files[0];
     if (!file) return setStatus(status, 'error', 'Choose a file first.');
     if (file.size > MAX_PLAINTEXT) return setStatus(status, 'error', TOO_LARGE);
@@ -362,12 +342,11 @@
     if (!Number.isInteger(lifetime) || lifetime <= 0 || lifetime > MAX_LIFETIME || !DOWNLOAD_LIMITS.has(maxDownloads)) {
       return setStatus(status, 'error', 'Choose an expiry of at most 7 days and a download limit from the list.');
     }
-    // Machine-made, so surrounding whitespace is a paste artefact, not part of it.
+    // Tokens never contain spaces; trim paste leftovers.
     const token = $('upload-token').value.trim();
     if (token === '') return setStatus(status, 'error', 'Enter your upload token. The server\'s admin gives one to each member.');
 
-    // Computed once: the same two values are sealed into the header and sent
-    // beside the blob (§10). A mismatch would be a bug here, not a negotiation.
+    // Computed once: the same value is sealed in the file and sent to the server (§10).
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = Math.min(now + lifetime, now + MAX_LIFETIME - CLOCK_MARGIN);
 
@@ -430,10 +409,9 @@
       }
       flow.done('upload', `${formatBytes(blob.size)} stored.`);
 
-      // Only a token the server accepted is remembered.
+      // Remember the token only once the server has accepted it.
       if ($('remember-token').checked) rememberToken(token);
       $('link').value = `${location.origin}/d/${id}#${fragment}`;
-      // For a public file the fragment is the whole secret; the page says so.
       $('link-public').hidden = restricted;
       $('link-restricted').hidden = !restricted;
       $('owner-token').textContent = ownerToken;
@@ -454,15 +432,14 @@
   // ---- download -------------------------------------------------------------
 
   function formatTime(seconds) {
-    // Date covers ±8.64e12 seconds; anything later is shown as the raw number.
+    // Beyond what Date can show, print the raw number.
     return seconds <= 8640000000000n
       ? new Date(Number(seconds) * 1000).toLocaleString()
       : `${seconds} seconds after 1970`;
   }
 
-  // GET, as bytes. `onProgress(received, declared)` drives a bar, nothing
-  // else: `declared` is the server's Content-Length, or 0. The size a file is
-  // checked against comes from inside it (§6.5), never from here.
+  // GET as bytes. Content-Length only drives the progress bar; the real size
+  // check uses the size sealed inside the file (§6.5).
   async function fetchBytes(url, onProgress) {
     let response;
     try {
@@ -497,13 +474,12 @@
       }
       return bytes;
     } catch (err) {
-      // The server hands back an unfinished download's claim (step 06).
+      // The server refunds an unfinished download.
       throw coded('network', `The download was interrupted (${err.message}). It did not use up the link: try again.`);
     }
   }
 
-  // `name` is hostile. Path separators are stripped so it cannot name a
-  // directory, and the Blob's type is fixed: `type` never decides anything.
+  // `name` is hostile: strip path separators, and always save as octet-stream.
   function save(plaintext, name) {
     const safe = name.replace(/[/\\]/g, '');
     const url = URL.createObjectURL(new Blob([plaintext], { type: 'application/octet-stream' }));
@@ -536,14 +512,12 @@
       return setStatus(status, 'error', explain(err, false));
     }
     const restricted = (preview.flags & C.FLAG_PASSPHRASE) !== 0;
-    // Which kind of link this is, before any prompt or work. The flag is what
-    // the server sent until the details open (§7); a server that flips it gets
-    // a file that does not open.
+    // Say which kind of link this is before asking for anything. A server that
+    // lies about it just gets a file that won't open (§7).
     $('download-public').hidden = restricted;
     $('download-restricted').hidden = !restricted;
 
-    // After the details opened, the page knows the verified limits, so a file
-    // gone since can be explained better than the server's one answer.
+    // We know the verified limits by now, so we can guess why the file is gone.
     function gone() {
       if (BigInt(Math.floor(Date.now() / 1000)) >= preview.expiresAt) {
         return `The server no longer has this file. By this device's clock it expired on ${formatTime(preview.expiresAt)}.`;
@@ -566,7 +540,7 @@
           setStatus(status, 'busy', 'Opening…', 'open');
         }
         const fileKey = await C.unlockFile(preview, secret, passphrase);
-        // Opening the metadata verifies flags, expires_at and max_downloads (§7).
+        // This also verifies the flags and limits (§7).
         const metadata = await C.decryptMetadata(fileKey, preview.headerCore);
         if (restricted) flow.done('stretch', 'Passphrase accepted.');
         showDetails(metadata);
@@ -590,9 +564,7 @@
       $('file-limit').textContent = preview.maxDownloads === 0
         ? 'none (expires by time only)'
         : `${preview.maxDownloads} download${preview.maxDownloads === 1 ? '' : 's'}`;
-      // §8: the one server misbehaviour a client can see. Decrypt anyway; never
-      // silently. The server refuses expired files itself, so this is reached
-      // only through a skewed clock here or a server that ignores expiry.
+      // §8: the server sent an expired file. Allow it, but never silently.
       if (BigInt(Math.floor(Date.now() / 1000)) > preview.expiresAt) {
         $('expired-warning').textContent =
           `The sender set this link to expire on ${expiry}. The server provided it anyway.`;
@@ -623,9 +595,7 @@
 
         setStatus(status, 'busy', 'Decrypting and checking every piece…', 'decrypt');
         flow.measure('decrypt', 0, 1, '0%');
-        // Throws unless the header matches the preview, every record
-        // authenticates, the final record is there and the size matches.
-        // Nothing reaches the user before that.
+        // Throws unless every piece checks out; nothing is saved before that.
         const { metadata, plaintext } = await C.decryptFile(fileKey, preview, blob,
           ({ done, total }) => flow.measure('decrypt', done, total, percent(done, total)));
         flow.done('decrypt', 'Every piece checked.');

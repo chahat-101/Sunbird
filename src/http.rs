@@ -1,5 +1,5 @@
-//! Routes, handlers, and the one error type every refusal goes through. No
-//! handler writes a status code; an `ApiError` variant owns each one.
+//! Routes, handlers, and the error type. Each `ApiError` variant owns its
+//! status code.
 
 use std::fmt::Display;
 use std::io;
@@ -24,8 +24,7 @@ pub type Body = BoxBody<Bytes, io::Error>;
 /// Every way a request is refused.
 #[derive(Debug)]
 pub enum ApiError {
-    /// Malformed, never issued, and deleted alike: one answer, so a response
-    /// never says which.
+    /// Malformed, unknown and deleted IDs get the same answer.
     NotFound,
     NoOwnerToken,
     WrongOwnerToken,
@@ -33,8 +32,7 @@ pub enum ApiError {
     NotAMember,
     /// No admin token, or one no admin in the config has.
     NotAnAdmin,
-    /// Retry after this many seconds. The same for a real, a missing and a
-    /// malformed ID: the limiter runs before the ID is looked at.
+    /// The same for any ID: the limiter runs before the ID is read.
     RateLimited(u64),
     BadLimits(&'static str),
     /// The body stopped before it ended: the client went away.
@@ -101,11 +99,8 @@ fn internal<E: Display>(message: &'static str) -> impl FnOnce(E) -> ApiError {
     }
 }
 
-/// Lets pages run only the client's own scripts, and hash-wasm compile its
-/// WebAssembly, and show images from its own origin (the masthead photo). The
-/// client renders decrypted metadata, which is hostile input, as text; this is
-/// the backstop if that ever slips. `img-src 'self'` does not weaken that: the
-/// page never makes an image of a file (the file is never previewed).
+/// Only the page's own scripts, styles and images, plus WebAssembly for
+/// hash-wasm. A backstop in case hostile metadata is ever rendered as HTML.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
@@ -128,9 +123,8 @@ where
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CONTENT_SECURITY_POLICY),
     );
-    // Nothing between here and a client may reuse one kind of fetch of a URL
-    // for another (PrivateBin's reason). A link preview fetches the page, and
-    // only the page's script fetches the blob.
+    // A link preview fetches the page; only the page's script fetches the blob
+    // (PrivateBin's reason).
     headers.insert(header::VARY, HeaderValue::from_static("Accept"));
     res
 }
@@ -147,9 +141,8 @@ where
     match *req.method() {
         Method::POST if path == "/api/upload" => upload(app, req).await,
         _ if get && (path.starts_with("/api/meta/") || path.starts_with("/api/download/")) => {
-            // Before the ID is so much as parsed, and counting every request
-            // whatever it would get: a refusal is the same bytes for a real,
-            // a missing and a malformed ID, so the limit reveals nothing.
+            // Count every request before parsing the ID, so the limit reveals nothing
+            // about which IDs exist.
             let client = limit::client(
                 peer,
                 req.headers().get_all("x-forwarded-for").iter(),
@@ -203,13 +196,9 @@ async fn blocking<T: Send + 'static>(
 
 // ---- upload -----------------------------------------------------------------
 
-/// Every refusal that can come before the body does: no member's token (401),
-/// the member's rate (429), the limits (400), then a declared length over
-/// max_blob or over the member's quota (413), then one that would take the
-/// disk below min_free_bytes (507). Then the body streams to tmp/ and is cut
-/// off at the smaller of max_blob and the member's room, or when free space
-/// reaches the floor; nothing is buffered to find its length. The quota is
-/// checked a third time, and decisively, when the file is saved.
+/// Cheap refusals first: token (401), rate (429), limits (400), size or
+/// quota (413), disk floor (507). Then the body streams to tmp/, cut off at
+/// the first limit it hits. The quota is checked once more when saving.
 async fn upload<B>(app: Arc<App>, req: Request<B>) -> Result<Response<Body>, ApiError>
 where
     B: HttpBody<Data = Bytes> + Unpin,
@@ -225,9 +214,8 @@ where
     })?;
     let limits = Limits::parse(req.uri().query(), (app.now)()).map_err(ApiError::BadLimits)?;
 
-    // From here an upload that stores nothing, other than by a refusal, is a
-    // failed upload. Counted when this is dropped, so an upload cut off at
-    // shutdown, whose future is dropped mid-await, counts too.
+    // Anything past here that stores nothing counts as a failed upload, even if
+    // shutdown drops it mid-await.
     let mut failed = FailedUpload(Some(app.clone()));
     let stored = receive(&app, req.into_body(), member, limits).await;
     match &stored {
@@ -271,8 +259,7 @@ where
     if declared > MAX_BLOB {
         return Err(ApiError::TooLarge);
     }
-    // The first check: the declared length, or with none, whether even an
-    // empty file fits (a member at their file limit is refused here).
+    // The declared length must fit the quota. With none, an empty file must.
     let usage = blocking(app, {
         let id = member.id.clone();
         move |app| app.usage(&id)
@@ -285,8 +272,7 @@ where
         .admit(&usage, declared, now)
         .map_err(ApiError::OverQuota)?;
     let room = member.quota.room(&usage);
-    // The disk floor, before a byte of the body: the declared length must fit
-    // above it.
+    // The declared length must fit above the disk floor.
     disk_room(app, declared).await?;
 
     let tmp = TempFile(app.temp_path());
@@ -314,10 +300,7 @@ where
                 Ok(()) => ApiError::TooLarge,
             });
         }
-        // The floor again, before any MiB is written unchecked: other uploads
-        // share the disk, and a full one fails this one at 90% with a
-        // partial blob. What is left of the declared length must fit too,
-        // and at least this chunk.
+        // Check the floor again before each MiB: other uploads share the disk.
         if unchecked + data.len() as u64 > DISK_CHECK_EVERY {
             let written = size - data.len() as u64;
             disk_room(app, declared.saturating_sub(written).max(data.len() as u64)).await?;
@@ -365,8 +348,7 @@ async fn disk_room(app: &Arc<App>, more: u64) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// An upload's file in tmp/, removed on every path: on success its blob has
-/// been linked under its ID's name, so the temp name is not needed either.
+/// The upload's temp file, removed on every path.
 struct TempFile(std::path::PathBuf);
 
 impl Drop for TempFile {
@@ -381,11 +363,8 @@ impl Drop for TempFile {
 
 // ---- meta and download ------------------------------------------------------
 
-/// Sends the first min(limit, size) bytes of a blob, raw. The server never
-/// looks inside: the preview is a byte count, not the header (§3).
-///
-/// With `claim`, one of the file's downloads is claimed first, and the claim
-/// rides in the response body until the transfer ends.
+/// Sends the first min(limit, size) bytes, raw; the server never looks inside
+/// (§3). With `claim`, a download is claimed first and held until the end.
 async fn serve(
     app: Arc<App>,
     id: &str,
@@ -409,9 +388,7 @@ async fn serve(
         id: id.clone(),
         completed: false,
     });
-    // The owner or the sweeper may delete the file while it streams. On POSIX
-    // that is harmless, and deliberately not locked against: the open
-    // descriptor keeps the bytes until it is closed, and the transfer completes.
+    // A delete during streaming is fine on POSIX: the open file keeps the bytes.
     let file = match tokio::fs::File::open(app.blob_path(&id)).await {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ApiError::NotFound), // deleted since the query
         file => file.map_err(internal("could not read blob"))?,
@@ -431,8 +408,7 @@ async fn serve(
         .expect("valid response"))
 }
 
-/// A claimed download. Dropped, it ends: counted if `completed`, refunded if
-/// not. The database work runs off the async workers.
+/// A claimed download: counted if completed, refunded if not.
 struct Claim {
     app: Arc<App>,
     id: FileId,
@@ -457,12 +433,8 @@ struct Blob {
     claim: Option<Claim>,
 }
 
-/// hyper drops the body when the response ends. If every byte was handed over,
-/// the download completed; if the client went away first, it did not. (Bytes
-/// handed to hyper may still be in its buffers when the connection dies: to a
-/// client that stopped reading, it queues up to about 400 KiB before it must
-/// write. Past hyper are the socket, and any proxy, which hold more. So
-/// completed means sent, never received: see the README, Counters.)
+/// hyper drops the body when the response ends. Completed means every byte
+/// was handed to hyper, not that the client received it (see deploy/README).
 impl Drop for Blob {
     fn drop(&mut self) {
         if let Some(claim) = &mut self.claim {
@@ -488,8 +460,8 @@ impl HttpBody for Blob {
         ready!(Pin::new(&mut this.file).poll_read(cx, &mut buf))?;
         let n = buf.filled().len();
         if n == 0 {
-            // The row promised more than the file has. Ending the response
-            // short, not padding it, makes the client see a failed transfer.
+            // The file is shorter than the row says. End short so the client sees a
+            // failed transfer.
             return Poll::Ready(Some(Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "blob shorter than its row",
@@ -545,9 +517,8 @@ async fn delete(
         .expect("valid response"))
 }
 
-/// An admin's deletion: `DELETE /api/admin/<id>` with an admin token. Unlike
-/// the owner's, it reaches a file that has expired or been used up but not yet
-/// swept, and it answers 404 only when there is no row at all.
+/// `DELETE /api/admin/<id>`. Unlike the owner, an admin can delete a file that
+/// has expired but not been swept yet.
 async fn admin_delete(
     app: Arc<App>,
     id: &str,
@@ -575,8 +546,7 @@ async fn admin_delete(
 
 // ---- stats ------------------------------------------------------------------
 
-/// `GET /admin/stats` with an admin token: the counters, totals only. Nothing
-/// here names a file or a member.
+/// `GET /admin/stats`: totals only, never a file or a member.
 fn stats(app: &App, token: Option<&str>) -> Result<Response<Body>, ApiError> {
     token
         .and_then(|token| app.config.admin(token))
@@ -589,8 +559,7 @@ fn stats(app: &App, token: Option<&str>) -> Result<Response<Body>, ApiError> {
 /// The page, served at / and at /d/<anything>: the link a recipient opens.
 const INDEX: &[u8] = include_bytes!("../web/index.html");
 
-/// The files index.html loads. Nothing else in web/ is built in or served: no
-/// tests, no directory listings.
+/// The only files served from web/. No tests, no listings.
 const ASSETS: [(&str, &str, &[u8]); 9] = [
     (
         "/app.css",
@@ -682,9 +651,8 @@ fn empty() -> Body {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    //! The endpoints, driven straight through `handle`, with request bodies
-    //! that count what the server pulled from them. The helpers are shared with
-    //! the app and db tests.
+    //! Endpoint tests, driven through `handle`. The helpers are shared with the
+    //! app and db tests.
 
     use std::fs;
     use std::net::IpAddr;
@@ -735,8 +703,7 @@ pub(crate) mod tests {
     pub(crate) const LOTS: u64 = 1 << 40;
     pub(crate) const NO_LIMIT: [u64; 3] = [LOTS, LOTS, LOTS];
 
-    /// A member entry: `quota` is max_active_bytes, max_active_files,
-    /// max_bytes_per_week.
+    /// A member entry. `quota` is (bytes, files, bytes per week).
     pub(crate) fn member(id: &str, name: &str, token: &str, quota: [u64; 3]) -> serde_json::Value {
         serde_json::json!({
             "id": id, "name": name, "token_sha256": hex(&token_sha256(token)),
@@ -744,9 +711,7 @@ pub(crate) mod tests {
         })
     }
 
-    /// A config of `members` and the one admin, with no trusted proxies and
-    /// rates no test reaches, as `edit` leaves it. Through the parser, as the
-    /// binary reads one.
+    /// A config with `members` and one admin, parsed like the real one.
     pub(crate) fn config(
         members: Vec<serde_json::Value>,
         edit: impl FnOnce(&mut serde_json::Value),
@@ -812,9 +777,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A request body. `len` bytes of zeros (None: endless), then the end, or an
-    /// error if `fails`. `declared` is its Content-Length. `read` counts what the
-    /// server pulled.
+    /// A request body: `len` zero bytes (None: endless), then the end or an
+    /// error. `read` counts what the server pulled.
     pub(crate) struct Source {
         pub(crate) data: Vec<u8>,
         pub(crate) left: Option<u64>,
@@ -1003,8 +967,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// Waits up to 5 seconds for `done`: a transfer's end is recorded off the
-    /// request, after its body is dropped.
+    /// Wait up to 5 s for `done`: it's recorded after the body is dropped.
     pub(crate) async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done() {
@@ -1100,8 +1063,7 @@ pub(crate) mod tests {
         assert_eq!(r.headers["vary"], "Accept");
     }
 
-    /// Below 8 KiB the preview is the whole blob, records and all; the server does
-    /// not look for where the header ends.
+    /// Below 8 KiB the preview is the whole blob.
     #[tokio::test]
     async fn meta_of_short_blobs() {
         let s = server();
@@ -1409,9 +1371,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// The limits are checked against the server's clock, exactly, before a byte of
-    /// the body is read, and refused rather than clamped. They are stored now;
-    /// expiry (session 02) enforces them.
+    /// Limits are checked against the server's clock before the body, and
+    /// refused, not clamped.
     #[tokio::test]
     async fn upload_limits() {
         const NOW: i64 = 1_800_000_000;
@@ -1578,8 +1539,7 @@ pub(crate) mod tests {
         format!("/api/upload?expires_at={expires_at}&max_downloads={max_downloads}")
     }
 
-    /// A download request whose body is not read: its response, with the
-    /// transfer not yet started.
+    /// A download whose body hasn't been read yet.
     async fn start_download(s: &Server, id: &str) -> Body {
         let req = Request::get(format!("/api/download/{id}"))
             .body(Source::bytes(b""))
@@ -1589,9 +1549,8 @@ pub(crate) mod tests {
         res.into_body()
     }
 
-    /// Sixteen downloads of a 1-download file at once, round after round:
-    /// exactly one is served, and then the file is deleted. Checking in one
-    /// statement and claiming in another loses this within a few rounds.
+    /// Sixteen parallel downloads of a one-download file: exactly one wins, and
+    /// the file is deleted. A separate check-then-claim loses this quickly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn last_download_race() {
         const ROUNDS: usize = 100;
@@ -1634,9 +1593,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A transfer that stops partway does not count: its claim is refunded and
-    /// the file can still be downloaded. And a file is not deleted when its last
-    /// download completes while another is in flight, since that one may fail.
+    /// A transfer that stops partway is refunded. A file isn't deleted while
+    /// another download is still in flight.
     #[tokio::test]
     async fn aborted_download_is_refunded() {
         let s = server();
@@ -1688,8 +1646,8 @@ pub(crate) mod tests {
         .await;
         assert!(!blob_exists(&s, &u.id));
 
-        // Two downloads allowed, both in flight. One completes, which uses the
-        // file up; the other fails, which gives one back.
+        // Two in flight: one completes and uses the file up, the other fails and
+        // gives one back.
         let u = upload_with(&s, &limits_path(now() + 3600, 2), &blob).await;
         let download = format!("/api/download/{}", u.id);
         let (mut a, b) = (
@@ -1758,9 +1716,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Expired, or with every download claimed, a file is answered exactly as an
-    /// ID never issued, on every endpoint, from the moment it is: before any
-    /// sweep has deleted it.
+    /// Expired or used up files look exactly like unknown IDs, before any sweep.
     #[tokio::test]
     async fn spent_files_are_not_found() {
         const T0: i64 = 1_800_000_000;
@@ -1851,10 +1807,8 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// No token, a wrong one, the hash of a real one, and an admin's: all 401,
-    /// before a byte of the body is read, with nothing stored. And a member
-    /// removed from the config: their token stops working at the restart, and
-    /// their files stay recorded as theirs, by id.
+    /// Bad, hashed or admin tokens are all 401 before the body is read. A removed
+    /// member's token stops working, but their files stay recorded as theirs.
     #[tokio::test]
     async fn upload_requires_a_members_token() {
         let s = server();
@@ -1909,8 +1863,7 @@ pub(crate) mod tests {
         assert_eq!(uploader_of(&s, &u.id).as_deref(), Some(MEMBER_ID));
     }
 
-    /// A rename changes the display name and nothing else: rows hold the id,
-    /// so the member's files, and the quota they use, are still theirs.
+    /// A rename changes only the display name; files and quota stay with the id.
     #[tokio::test]
     async fn renamed_member_keeps_their_quota() {
         let two_files = [LOTS, 2, LOTS];
@@ -1947,9 +1900,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A new member given a departed member's name is a new id. They inherit
-    /// none of the quota used, and a takedown of the departed member's file
-    /// names the departed member's id, not theirs.
+    /// Reusing a departed member's name gives a new id, with none of their quota
+    /// or files.
     #[tokio::test]
     async fn reused_name_inherits_nothing() {
         capture_logs();
@@ -2014,9 +1966,8 @@ pub(crate) mod tests {
         assert!(line.contains("no longer in the config"), "{line}");
     }
 
-    /// Only an admin token deletes by id. It reaches a file that has expired
-    /// but not been swept, which the owner cannot; the deletion is verified,
-    /// blob then row; and the log names the admin, the file and the uploader.
+    /// Only an admin can delete by id, even an expired unswept file. Deletion is
+    /// verified, and the log names the admin, the file and the uploader.
     #[tokio::test]
     async fn admin_delete() {
         const T0: i64 = 1_800_000_000;
@@ -2105,8 +2056,7 @@ pub(crate) mod tests {
         r.json()["error"].as_str().unwrap().to_owned()
     }
 
-    /// Stored bytes are freed when a file expires, not when the sweep after it
-    /// runs, and when a file is deleted.
+    /// Quota is freed when a file expires or is deleted, not at the next sweep.
     #[tokio::test]
     async fn active_bytes_freed_by_expiry_and_deletion() {
         static CLOCK: AtomicI64 = AtomicI64::new(T0);
@@ -2162,9 +2112,8 @@ pub(crate) mod tests {
         upload_with(&s, &path, &random_blob(800)).await;
     }
 
-    /// The weekly allowance is counted from the upload ledger, which deleting
-    /// a file does not touch: upload, delete, upload again is refused. It
-    /// frees only as each upload leaves the 7 days.
+    /// The weekly allowance comes from the upload ledger, so deleting a file
+    /// doesn't refund it.
     #[tokio::test]
     async fn weekly_bytes_not_freed_by_deletion() {
         static CLOCK: AtomicI64 = AtomicI64::new(T0);
@@ -2243,9 +2192,7 @@ pub(crate) mod tests {
 
     const WEEK: i64 = crate::config::WEEK;
 
-    /// Refused as soon as it can be: a declared length over the member's room
-    /// before a byte is read, and a body with no length once it passes the
-    /// room, not max_blob. Each limit's own room caps the stream. Nothing is
+    /// Refused as early as possible, by whichever limit is smaller. Nothing is
     /// stored.
     #[tokio::test]
     async fn stream_cut_off_at_the_quota() {
@@ -2321,9 +2268,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Sixteen uploads race for the last of a member's room, round after
-    /// round. They all pass the checks before and during the body, since none
-    /// is saved yet; the check in the saving transaction lets exactly one land.
+    /// Sixteen uploads race for a member's last bit of room; the check when
+    /// saving lets exactly one through.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn parallel_uploads_race_for_the_last_room() {
         const ROUNDS: usize = 20;
@@ -2380,8 +2326,7 @@ pub(crate) mod tests {
 
     // ---- rate limits --------------------------------------------------------
 
-    /// Uploads are limited per member: over the rate, 429 with Retry-After,
-    /// before the body is read, and another member is unaffected.
+    /// Upload rate is per member: 429 with Retry-After, before the body.
     #[tokio::test]
     async fn upload_rate_per_member() {
         let s = server_config(
@@ -2411,10 +2356,8 @@ pub(crate) mod tests {
         assert_eq!(rows(&s), 3);
     }
 
-    /// The read limit says nothing about which IDs exist. It runs before the
-    /// ID is parsed and counts every request, so a real, a missing and a
-    /// malformed ID are each refused at the same request, and the refusals
-    /// are the same bytes: status, headers and body.
+    /// The read limit can't be used to probe IDs: real, missing and malformed
+    /// IDs get identical refusals at the same request.
     #[tokio::test]
     async fn read_limit_does_not_leak_existence() {
         let s = server_config(
@@ -2465,10 +2408,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Behind a trusted proxy the read limit is per client, not per proxy, and
-    /// a forged X-Forwarded-For cannot move a client out of its bucket. Two
-    /// addresses in one IPv6 /64 are one client. With no trusted proxies the
-    /// header changes nothing.
+    /// Behind a trusted proxy, the read limit is per client and a forged
+    /// X-Forwarded-For can't escape it. One IPv6 /64 is one client.
     #[tokio::test]
     async fn read_limit_keyed_by_the_client_address() {
         let one = serde_json::json!({ "requests": 1, "seconds": 3600 });
@@ -2591,10 +2532,8 @@ pub(crate) mod tests {
         "counting_since",
     ];
 
-    /// Only an admin's token opens the stats: none, a wrong one, a member's, and
-    /// the admin token's hash are 401. What it returns is totals and nothing
-    /// else: exactly the counters, each a number, and no file id, owner token,
-    /// member id or name anywhere in it.
+    /// Only an admin token opens the stats, and they contain totals only: no
+    /// ids, tokens or names.
     #[tokio::test]
     async fn admin_stats_are_totals_behind_admin_auth() {
         let s = server();
@@ -2645,8 +2584,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// A disk that fills as files are written to it: free space is CAPACITY less
-    /// what is in blobs/ and tmp/.
+    /// A fake disk: free space is CAPACITY minus what's in blobs/ and tmp/.
     static CAPACITY: AtomicU64 = AtomicU64::new(0);
 
     fn filling_disk(tmp: &Path) -> std::io::Result<u64> {
@@ -2663,11 +2601,9 @@ pub(crate) mod tests {
     const FLOOR: u64 = 10 << 20;
     const MIB: u64 = 1 << 20;
 
-    /// With a Content-Length, the floor is exact: an upload that would leave
-    /// exactly min_free_bytes free is stored, and one byte more is refused
-    /// with 507 before a byte of the body is read. Without one, the stream is
-    /// cut off once free space reaches the floor, within a MiB of it, and the
-    /// partial file is removed. Every refusal is counted.
+    /// With a Content-Length the floor is exact, and refused before the body.
+    /// Without one, the stream is cut off within a MiB of the floor and the
+    /// partial file removed. Every refusal is counted.
     #[tokio::test]
     async fn disk_floor() {
         let s = server_config(
@@ -2722,9 +2658,8 @@ pub(crate) mod tests {
             "below the floor"
         );
 
-        // No declared length, and 3 MiB of room for a body of 8: the stream is
-        // cut off once free space reaches the floor. It is checked at least
-        // every MiB, so at most a MiB and a chunk past the room are read.
+        // No declared length: cut off once free space hits the floor, checked at
+        // least every MiB.
         CAPACITY.store(FLOOR + n + 3 * MIB, Ordering::Relaxed);
         let body = Source::zeros(Some(8 * MIB), None);
         let read = body.counter();
@@ -2745,18 +2680,14 @@ pub(crate) mod tests {
             "the partial file was left behind"
         );
 
-        // A declared length is checked again as it streams, against what is
-        // left of it: a body that lies about its length gets no further.
+        // A body that lies about its length gets no further.
         CAPACITY.store(FLOOR + n + 3 * MIB, Ordering::Relaxed);
         let body = Source::zeros(Some(8 * MIB), Some(MIB));
         let r = send(&s, "POST", &live_path(), body, MEMBER_TOKEN).await;
         assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "a false length");
         assert_eq!(entries(&s, "tmp"), 0);
 
-        // Exactly room for a declared 4 MiB, and then another upload takes
-        // 2 MiB of it while this one streams. Each check counts what is left
-        // of the declared length, so the first one refuses it, a MiB in, not
-        // the one that finds the disk at the floor.
+        // Another upload takes space mid-stream; the next check refuses this one.
         CAPACITY.store(FLOOR + n + 4 * MIB, Ordering::Relaxed);
         let body = Taken {
             left: 4 * MIB,
@@ -2789,8 +2720,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// `left` bytes of zeros, declared, in 64 KiB chunks; after the first, 2 MiB
-    /// of the disk is taken by someone else.
+    /// `left` zero bytes in 64 KiB chunks; after the first, 2 MiB of disk is
+    /// taken by someone else.
     struct Taken {
         left: u64,
         taken: bool,
@@ -2847,10 +2778,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every counter, driven by the thing it counts, failures forced: an upload
-    /// whose client goes away, one cut off mid-body as shutdown does, a
-    /// download dropped partway, and a deletion the filesystem refuses, twice.
-    /// Refusals (401, 413) are not failures and count nowhere.
+    /// Every counter, driven by what it counts, including forced failures.
+    /// Refusals (401, 413) count nowhere.
     #[tokio::test]
     async fn counters_count() {
         use std::os::unix::fs::PermissionsExt;
@@ -2868,8 +2797,7 @@ pub(crate) mod tests {
         );
         let path = |max_downloads: u32| limits_path(T0 + 60, max_downloads);
 
-        // Two stored, 202,000 bytes: a is several chunks long, so a download
-        // of it can stop partway.
+        // Two stored files; `a` is long enough to stop partway.
         let a = upload_with(&s, &path(0), &random_blob(200_000)).await;
         let b = upload_with(&s, &path(1), &random_blob(2000)).await;
         // And one that expires later: deleted by the sweeper, but not expired.
@@ -2897,8 +2825,7 @@ pub(crate) mod tests {
         };
         let r = send(&s, "POST", &path(0), gone, MEMBER_TOKEN).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST);
-        // Cut off mid-body, the request dropped unanswered: what shutdown
-        // does to an upload still going at the end of the grace period.
+        // Cut off mid-body, as shutdown does after the grace period.
         let req = Request::post(path(0))
             .header("Authorization", format!("Bearer {MEMBER_TOKEN}"))
             .body(Stall(false))
@@ -2934,11 +2861,8 @@ pub(crate) mod tests {
             assert_eq!(get(&s, &format!("/api/meta/{}", a.id)).await.status, want);
         }
 
-        // c's owner deletes it and the filesystem refuses: a failure, and c
-        // stays marked for the sweeper. Then a and the empty file expire. The
-        // first sweep cannot delete any of the three, and neither can the
-        // second: a failure per file per attempt. The third deletes them all,
-        // two of them expired.
+        // The filesystem refuses deletes: one failure per file per attempt, until
+        // the third sweep deletes them all.
         let blobs = s.dir.0.join("blobs");
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o500)).unwrap();
         let r = send(
@@ -2982,8 +2906,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// The counters, saved and the directory opened again, carry on where they
-    /// were, counting_since included. Opening alone writes nothing.
+    /// Saved counters carry on after reopening. Opening alone writes nothing.
     #[tokio::test]
     async fn counters_survive_a_restart() {
         let s = server();
@@ -3021,11 +2944,8 @@ pub(crate) mod tests {
         assert_eq!(stats(&s).await["uploads"].as_u64(), Some(2), "counting on");
     }
 
-    /// Pruning the ledger changes no quota answer, at the time it prunes or at
-    /// any later one. Two databases hold the same ledger, entries on either side
-    /// of every 7-day boundary the clock crosses; one is pruned at each step,
-    /// the other never. Their usage, and admit's answer for sizes on either side
-    /// of the weekly limit, agree throughout, and the pruned one does lose rows.
+    /// Pruning the ledger never changes a quota answer: a pruned and an unpruned
+    /// copy agree at every step.
     #[test]
     fn ledger_pruning_changes_no_quota_result() {
         use crate::db::Db;

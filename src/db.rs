@@ -1,5 +1,4 @@
-//! The database: the schema, its migrations, and the few statements the
-//! endpoints need.
+//! The database: schema, migrations, and the statements the endpoints need.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,24 +14,19 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 enum Migration {
     Sql(&'static str),
-    /// A change that must look at what is stored. It runs in the migration's
-    /// transaction.
+    /// A migration that has to look at stored data. Runs in its transaction.
     Fill(fn(&Transaction) -> Result<(), Error>),
 }
 
-/// The schema, as migrations. MIGRATIONS[i] takes a database from user_version
-/// i to i+1, and they run in order, each in its own transaction.
+/// The schema, as migrations. MIGRATIONS[i] takes user_version i to i+1, each in
+/// its own transaction.
 ///
-/// FROZEN ONCE SHIPPED, the way protocol.md is. Append a new migration and never
-/// edit an old one, not even to fix it, and not even its whitespace: SQLite keeps
-/// the text of every CREATE in sqlite_master, and a database that ran the old
-/// text keeps its result forever, with nothing to tell it apart from one that ran
-/// the new.
+/// FROZEN ONCE SHIPPED, like protocol.md. Append new migrations; never edit an
+/// old one, not even whitespace. SQLite stores the CREATE text, and a database
+/// that ran the old text keeps it forever.
 ///
-/// There is no migrations/4.sql, and none is missing. Migration 4 is a data fill
-/// with no schema change, so it is Rust (`member_ids`, below), not SQL. A
-/// version 3 database goes through it to 5; `migrate_step07_without_names`
-/// shows that.
+/// There is no 4.sql on purpose: migration 4 only fills data, so it's Rust
+/// (`member_ids`, below).
 const MIGRATIONS: [Migration; 5] = [
     // 1: the blobs table (steps 03 to 05 of the original server).
     Migration::Sql(include_str!("migrations/1.sql")),
@@ -46,19 +40,17 @@ const MIGRATIONS: [Migration; 5] = [
     Migration::Sql(include_str!("migrations/5.sql")),
 ];
 
-/// The one definition of a file that exists, used by every endpoint. A file
-/// that fails it gets the same 404 as an ID never issued: marked for deletion,
-/// expired (the clock at or past expires_at), or used up (every allowed
-/// download claimed, those still in flight included). max_downloads 0 is no
-/// download limit, not zero downloads. Binds :now.
+/// What "this file exists" means, for every endpoint. Deleted, expired or used
+/// up (in-flight downloads included) files get the same 404 as unknown IDs.
+/// max_downloads 0 means no limit. Binds :now.
 const SERVABLE: &str =
     "deleting = 0 AND expires_at > :now AND (max_downloads = 0 OR downloads < max_downloads)";
 
 pub struct Db(Connection);
 
 impl Db {
-    /// Opens the database at `path` in WAL mode and migrates it. A database
-    /// newer than this binary is refused, untouched.
+    /// Opens the database in WAL mode and migrates it. Refuses, untouched, a
+    /// database newer than this binary.
     pub fn open(path: &Path) -> Result<Db, Error> {
         let conn = Connection::open(path)?;
         let mode: String =
@@ -72,12 +64,9 @@ impl Db {
         Ok(db)
     }
 
-    /// Runs `f` in a transaction, which is the only way this type opens one.
-    /// It is IMMEDIATE: it takes the write lock at BEGIN. A deferred
-    /// transaction that reads and then writes must upgrade its lock, and in WAL
-    /// mode an upgrade after another connection has committed fails at once with
-    /// SQLITE_BUSY; busy_timeout does not help. In the original server's step 07
-    /// that let 2 of 16 parallel uploads through when there was room for one.
+    /// Runs `f` in an IMMEDIATE transaction, which takes the write lock up front.
+    /// A deferred one that reads then writes can fail with SQLITE_BUSY in WAL mode,
+    /// which once let 2 of 16 parallel uploads past a quota with room for one.
     pub fn write<T>(
         &mut self,
         f: impl FnOnce(&Transaction) -> Result<T, Error>,
@@ -90,9 +79,8 @@ impl Db {
         Ok(value)
     }
 
-    /// Brings the database up to MIGRATIONS.len(), one transaction per
-    /// migration together with its version bump, so a crash leaves the database
-    /// at a version it really is.
+    /// Runs each pending migration with its version bump in one transaction, so a
+    /// crash never leaves a half-migrated version.
     fn migrate(&mut self) -> Result<(), Error> {
         let version: i64 = self
             .0
@@ -124,9 +112,8 @@ impl Db {
         Ok(())
     }
 
-    /// Places a database whose user_version is 0. Steps 03 to 06 of the
-    /// original server never set it, so their columns say which schema they have. A new, empty file
-    /// has no blobs table.
+    /// Works out the schema of a database with user_version 0 from its columns
+    /// (early versions never set it). An empty file has no blobs table.
     fn unversioned(&self) -> Result<usize, Error> {
         let columns: Vec<String> = self
             .0
@@ -145,15 +132,12 @@ impl Db {
         }
     }
 
-    /// Stores a file's row, and its entry in the upload ledger, if the
-    /// uploader's quota has room for it. Ok(Err) is a refusal, with the message
-    /// for the member; nothing was written.
+    /// Stores a file's row and ledger entry if the uploader's quota allows.
+    /// Ok(Err) is a refusal with a message; nothing was written.
     ///
-    /// This is the last of the three quota checks, and the one that decides.
-    /// The first two, before and while the body is read, see usage without
-    /// holding anything, so parallel uploads all pass them. This one reads
-    /// usage and writes the row in one IMMEDIATE transaction, so uploads by the
-    /// same member queue here, and each sees the rows of those before it.
+    /// This is the deciding quota check. The earlier two hold no lock, so parallel
+    /// uploads all pass them; this one reads and writes in one IMMEDIATE
+    /// transaction, so they queue here.
     pub fn insert(
         &mut self,
         id: &FileId,
@@ -197,12 +181,9 @@ impl Db {
             .map(|size| size.map(|s| s as u64))
     }
 
-    /// Claims one download of a servable file and returns its size, or None if
-    /// it is not servable. The check and the claim are one statement, so two
-    /// racers for a file's last download cannot both see it available: a SELECT
-    /// and then an UPDATE would let them. The claim counts at once, so the file
-    /// stops being servable while its last download is still in flight;
-    /// `end_download` refunds it if the transfer fails.
+    /// Claims one download and returns the size, or None if not servable. Check
+    /// and claim are one statement, so two racers can't both take the last
+    /// download. `end_download` refunds the claim if the transfer fails.
     pub fn claim(&mut self, id: &FileId, now: i64) -> Result<Option<u64>, Error> {
         self.write(|tx| {
             let size = tx
@@ -219,11 +200,9 @@ impl Db {
         })
     }
 
-    /// Ends a claimed download: it stays counted if `completed`, and is
-    /// refunded if not. True if that left the file used up with no transfer in
-    /// flight, in which case it is now marked, for the caller to purge. A file
-    /// is not marked while a claim is in flight: that transfer may yet fail and
-    /// be refunded, and the file must then still be there.
+    /// Ends a claimed download: kept if `completed`, refunded if not. Returns true
+    /// if the file is now used up with nothing in flight (and marks it for
+    /// purging). Never marks while another transfer might still be refunded.
     pub fn end_download(&mut self, id: &FileId, completed: bool) -> Result<bool, Error> {
         self.write(|tx| {
             tx.execute(
@@ -240,8 +219,8 @@ impl Db {
         })
     }
 
-    /// Marks every file that is expired, or used up with no transfer in
-    /// flight: the sweeper's first step. Returns how many.
+    /// The sweeper's first step: mark every expired or used-up file. Returns how
+    /// many.
     pub fn mark_spent(&self, now: i64) -> rusqlite::Result<usize> {
         self.0.execute(
             "UPDATE blobs SET deleting = 1
@@ -251,9 +230,8 @@ impl Db {
         )
     }
 
-    /// Every file marked for deletion: those just marked, and those whose
-    /// deletion failed or was cut short by a crash. Each with whether it is
-    /// past its expiry time at `now`.
+    /// Every file marked for deletion, including earlier failed attempts, each
+    /// with whether it has expired at `now`.
     pub fn marked(&self, now: i64) -> Result<Vec<(FileId, bool)>, Error> {
         let rows: Vec<(String, bool)> = self
             .0
@@ -269,9 +247,7 @@ impl Db {
             .collect()
     }
 
-    /// Deletes the upload ledger's entries that no quota can count any more:
-    /// exactly those `usage` leaves out of the 7 days at `now`, and at every
-    /// later time. Returns how many.
+    /// Deletes ledger entries older than the 7-day window. Returns how many.
     pub fn prune_ledger(&self, now: i64) -> rusqlite::Result<usize> {
         self.0
             .execute("DELETE FROM uploads WHERE created_at <= ?", [now - WEEK])
@@ -299,10 +275,8 @@ impl Db {
         })
     }
 
-    /// Refunds every claim still in flight. Only at startup, when no transfer
-    /// can be: those claims belong to a process that stopped before their
-    /// transfers ended, and a transfer not known to have completed does not
-    /// count. Returns how many files had one.
+    /// At startup, refunds every claim left in flight by a stopped process.
+    /// Returns how many files had one.
     pub fn refund_in_flight(&self) -> rusqlite::Result<usize> {
         self.0.execute(
             "UPDATE blobs SET downloads = downloads - in_flight, in_flight = 0 WHERE in_flight > 0",
@@ -329,8 +303,8 @@ impl Db {
             .transpose()
     }
 
-    /// Marks a file never to be served again. False if it was not servable,
-    /// for instance because a concurrent delete marked it first.
+    /// Marks a file never to be served again. False if it wasn't servable (for
+    /// example, a concurrent delete got there first).
     pub fn mark_deleting(&self, id: &FileId) -> rusqlite::Result<bool> {
         Ok(self.0.execute(
             "UPDATE blobs SET deleting = 1 WHERE id = ? AND deleting = 0",
@@ -348,8 +322,8 @@ impl Db {
             .map(drop)
     }
 
-    /// Whether a row, in any state, refers to `id`, and if so who uploaded it:
-    /// None for a file uploaded before uploads were authenticated.
+    /// Whether any row has this `id`, and who uploaded it (None for files from
+    /// before uploads needed a token).
     pub fn uploader(&self, id: &FileId) -> rusqlite::Result<Option<Option<String>>> {
         self.0
             .query_row(
@@ -377,12 +351,11 @@ impl Db {
 
 /// A member's usage, as the quota counts it. Blob sizes, as stored.
 pub struct Usage {
-    /// (size, expires_at) of each file the member has that is not expired and
-    /// not marked for deletion, soonest to expire first. A used-up file whose
-    /// last download is still in flight counts: that transfer may be refunded.
+    /// (size, expires_at) of a member's live files, soonest first. A used-up file
+    /// with a download in flight still counts, since it may be refunded.
     pub files: Vec<(u64, i64)>,
-    /// (size, created_at) of each upload in the last 7 days, oldest first,
-    /// from the ledger. Deleting a file does not touch it.
+    /// (size, created_at) of each upload in the last 7 days, from the ledger.
+    /// Deleting a file doesn't touch it.
     pub week: Vec<(u64, i64)>,
 }
 
@@ -411,12 +384,8 @@ fn usage(conn: &Connection, member: &MemberId, now: i64) -> rusqlite::Result<Usa
     })
 }
 
-/// Migration 4: each member name stored as an uploader_id becomes the id of the
-/// config member with that name. No members are read until session 03, so this
-/// runs with an empty member list: a database with no stored names migrates,
-/// and one with any is refused untouched, naming them — as it would be if the
-/// config listed none of them. Session 03 supplies the members; no database this
-/// version can migrate would come out differently then.
+/// Migration 4: turn stored member names into member ids. It runs with no
+/// member list, so a database holding any names is refused untouched.
 fn member_ids(tx: &Transaction) -> Result<(), Error> {
     let names: Vec<String> = tx
         .prepare("SELECT uploader_id FROM blobs WHERE uploader_id IS NOT NULL UNION SELECT uploader_id FROM uploads")?
@@ -499,9 +468,8 @@ mod tests {
         old_data_dir(&all, &[])
     }
 
-    /// A step 05 file's limits are sealed where the server cannot read them, so
-    /// the migration guesses, and the guess errs toward less access: D9's 24 hours
-    /// and one download. The file is served once and then no more.
+    /// A step 05 file's limits are sealed where the server can't read them, so
+    /// guess cautiously: 24 hours and one download.
     #[tokio::test]
     async fn migrate_step05_database() {
         let now = now();
@@ -626,9 +594,8 @@ mod tests {
         );
     }
 
-    /// Step 07 recorded member names, and migration 4 maps each to the id of the
-    /// config member with that name. No members are read until session 03, so every
-    /// stored name is one no member has: the upgrade stops, database untouched.
+    /// Step 07 stored member names, and with no members known, the upgrade stops
+    /// and leaves the database untouched.
     #[test]
     fn migrate_step07_names_refused() {
         let now = now();
@@ -715,12 +682,9 @@ mod tests {
         );
     }
 
-    /// Db::write takes the write lock when the transaction begins, so racers that
-    /// read and then write queue rather than fail. Sixteen connections each insert
-    /// only if the table is empty: exactly one row, and no racer gets an error. A
-    /// deferred transaction fails most of them with SQLITE_BUSY. Migration 4 and
-    /// the quota check in `insert` read and then write; `quota_race_across_connections`
-    /// is this for the quota.
+    /// IMMEDIATE transactions make read-then-write racers queue instead of fail:
+    /// 16 connections each insert only if the table is empty, and exactly one row
+    /// lands with no errors.
     #[test]
     fn write_transactions_queue() {
         let dir = TempDir::new();
@@ -765,11 +729,9 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
-    /// Sixteen connections race for a 1-download file's only claim, round after
-    /// round: exactly one wins each, and none fails. Separate connections, as a
-    /// pool would have, so the one mutexed connection cannot hide a claim that
-    /// checks in one statement and claims in the next; that loses within a few
-    /// rounds.
+    /// Sixteen connections race for a one-download file, round after round:
+    /// exactly one wins and none fails. Separate connections, so the mutex can't
+    /// hide a broken check-then-claim.
     #[test]
     fn claim_race_across_connections() {
         const ROUNDS: usize = 200;
@@ -802,9 +764,8 @@ mod tests {
                 let (path, barrier, ids) = (path.clone(), barrier.clone(), ids.clone());
                 std::thread::spawn(move || {
                     let mut db = Db::open(&path).unwrap();
-                    // SQLite's own busy handler backs off to 100 ms a try, and
-                    // sixteen racers queue on one lock every round. Retrying every
-                    // 50 µs waits for the same lock, and takes seconds, not minutes.
+                    // SQLite's busy handler backs off to 100 ms; retrying every 50 µs keeps
+                    // this to seconds.
                     db.conn()
                         .busy_handler(Some(|tries| {
                             std::thread::sleep(std::time::Duration::from_micros(50));
@@ -839,10 +800,8 @@ mod tests {
         assert_eq!((downloads, in_flight), (ROUNDS as i64, ROUNDS as i64));
     }
 
-    /// Sixteen connections race to store a file where the member's quota has
-    /// room for one, round after round: exactly one lands each time, and none
-    /// fails. Separate connections, as for the claim, because the one mutexed
-    /// connection would serialise a check that is not in the transaction.
+    /// Sixteen connections race to store a file where the quota has room for
+    /// one: exactly one lands each round.
     #[test]
     fn quota_race_across_connections() {
         const ROUNDS: usize = 50;
@@ -905,14 +864,10 @@ mod tests {
         }
     }
 
-    /// tests/fixtures/r2 is a data directory made by this repository's R2
-    /// server, through its HTTP API, before uploads were authenticated
-    /// (manifest beside it). Its schema is version 5, which already has what
-    /// authentication stores, uploader_id and the upload ledger, so opening it
-    /// under R3 runs no migration, and changes neither schema nor rows. Its
-    /// files have no uploader: they are served as before, deleted by their
-    /// owner tokens, count against no member's quota, and can be taken down by
-    /// an admin, logged as having no uploader.
+    /// tests/fixtures/r2 comes from the R2 server, before uploads needed a
+    /// token. It's already schema 5, so opening it migrates nothing. Its files
+    /// have no uploader: served as before, deletable by owner token or admin, and
+    /// counted against nobody.
     #[tokio::test]
     async fn r2_directory_opens_under_auth() {
         capture_logs();
@@ -1049,11 +1004,8 @@ mod tests {
         );
     }
 
-    /// The schema v5 fixture came from a server that already authenticated
-    /// uploads, and recorded its uploader by member id, in the format
-    /// `mint-id` makes. Under a config listing that id, the files and the
-    /// ledger are that member's: four files stored, and 80,200 bytes uploaded
-    /// this week, the two since deleted included.
+    /// The schema-v5 fixture recorded uploaders by member id. With that id in the
+    /// config, the files and ledger belong to that member.
     #[tokio::test]
     async fn schema_v5_uploader_is_a_member_id() {
         let manifest: serde_json::Value =
@@ -1121,22 +1073,12 @@ mod tests {
             .unwrap()
     }
 
-    /// tests/fixtures/schema-v5 is a data directory at schema version 5 that
-    /// was produced before this rewrite, through a server's HTTP API: files
-    /// uploaded, one downloaded, two gone (manifest beside it). It is live data
-    /// in miniature, as a migration later will meet it.
+    /// tests/fixtures/schema-v5 is real data from before the rewrite (manifest
+    /// beside it). Its files expire on 2026-10-05, so the clock is pinned.
     ///
-    /// Its files expire on 2026-10-05, so the server's clock is set to when it
-    /// was made, not left to today's date.
-    ///
-    /// Version 5 is the current version, so opening it runs no migration. What
-    /// this proves: opening a directory that already holds rows and blobs
-    /// changes neither — every row, ledger entry and counter is as it was, every
-    /// file is served byte for byte, and the gone ones stay gone; and the
-    /// migrations, run on an empty database, still produce exactly this schema,
-    /// text and all, so no shipped migration has been edited. That migrations
-    /// apply in order to a directory with rows and blobs is the migrate_step*
-    /// tests' job, from versions 0 to 3.
+    /// Opening it must change nothing: every row, ledger entry and counter stays,
+    /// every file is served byte for byte. And running the migrations on an empty
+    /// database must produce exactly its schema, so no shipped migration was edited.
     #[tokio::test]
     async fn schema_v5_directory_survives_open() {
         let fixture = Path::new("tests/fixtures/schema-v5");

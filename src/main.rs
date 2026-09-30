@@ -1,5 +1,5 @@
-//! sunbird: a file-sharing server that stores blobs it never reads and does
-//! no cryptography; the browser client, built in, does all of it.
+//! sunbird: a file-sharing server that stores blobs it never reads. The built-in
+//! browser client does all the cryptography.
 //!
 //!     sunbird [-addr 127.0.0.1:8080] [-data data] [-config sunbird.json]
 //!     sunbird mint-token
@@ -29,9 +29,8 @@ use tokio::task::JoinSet;
 use crate::app::App;
 use crate::config::Config;
 
-/// How often the sweeper runs. A file past its limits is refused from the
-/// moment it is (the check is on every read); this bounds only how long its
-/// bytes stay on disk after that.
+/// How often the sweeper runs. Expired files are refused immediately; this only
+/// bounds how long their bytes stay on disk.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the counters are saved: a crash loses at most this much of them.
@@ -40,9 +39,8 @@ const SAVE_COUNTERS_EVERY: Duration = Duration::from_secs(60);
 /// How often the counters are logged, for reading without a metrics stack.
 const LOG_COUNTERS_EVERY: Duration = Duration::from_secs(3600);
 
-/// How long transfers in progress get to finish after SIGTERM. Not enough for
-/// every 100 MB upload on a slow link; nothing bounded is. deploy/sunbird.service
-/// gives the process longer than this before it kills it.
+/// How long transfers get to finish after SIGTERM. deploy/sunbird.service allows
+/// longer than this before killing the process.
 const GRACE: Duration = Duration::from_secs(30);
 
 const USAGE: &str = "usage: sunbird [-addr 127.0.0.1:8080] [-data data] [-config sunbird.json]
@@ -91,9 +89,8 @@ async fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        // The token is printed once, here, and kept nowhere: the config gets
-        // only its hash. Separate from mint-id, so that reissuing a lost or
-        // leaked token cannot change whose files are whose.
+        // Printed once and stored nowhere; the config gets only the hash. Separate
+        // from mint-id, so a new token never changes who owns what.
         ["mint-token"] => {
             let token = config::mint_token();
             println!("token:        {token}");
@@ -158,9 +155,8 @@ async fn main() -> ExitCode {
         flags.data.display()
     );
 
-    // Registered before the first connection, so a SIGTERM from then on is
-    // a shutdown, never the default action, which exits at once and loses
-    // the counters.
+    // Registered before accepting connections, so SIGTERM always shuts down
+    // cleanly and saves the counters.
     let (mut sigterm, mut sigint) = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
@@ -173,9 +169,8 @@ async fn main() -> ExitCode {
     };
 
     let mut background = JoinSet::new();
-    // The first tick is immediate: a sweep at startup, then one every
-    // SWEEP_EVERY. Without it, a file nobody asks for again would be kept
-    // forever: nothing else deletes an expired file.
+    // The first tick is immediate, so startup sweeps too. Nothing else deletes
+    // expired files.
     background.spawn({
         let app = app.clone();
         async move {
@@ -244,8 +239,8 @@ async fn main() -> ExitCode {
                     let app = app.clone();
                     async move { Ok::<_, Infallible>(http::handle(app, peer.ip(), req).await) }
                 });
-                // No overall read timeout: a 100 MB upload on a slow link is
-                // legitimate. The headers get 10 seconds.
+                // No overall read timeout: slow 100 MB uploads are legitimate. Headers get
+                // 10 seconds.
                 let served = graceful.watch(
                     http1::Builder::new()
                         .timer(TokioTimer::new())
@@ -261,10 +256,9 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Shutdown. Stop accepting; let each connection finish the request it is
-    // on, and close idle ones at once; cut off whatever is still going after
-    // GRACE. Every way out of here saves the counters and closes the
-    // database; none is an early return.
+    // Shutdown: stop accepting, let requests in progress finish, close idle
+    // connections, and cut off anything still running after GRACE. Every path
+    // saves the counters and closes the database.
     drop(listener);
     log::info!(
         "{stop}: no longer accepting connections; waiting up to {} s for {} to finish",
@@ -283,9 +277,8 @@ async fn main() -> ExitCode {
     }
     connections.shutdown().await;
     background.shutdown().await;
-    // A download cut off ends its claim on a blocking thread, which holds the
-    // app until the refund, and its failed_downloads count, are recorded.
-    // Save only after those.
+    // Cut-off downloads record their refund on a blocking thread; save after
+    // those finish.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while Arc::strong_count(&app) > 1 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;

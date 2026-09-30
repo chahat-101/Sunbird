@@ -1,16 +1,9 @@
-/* One stylesheet, served from 'self' (the CSP allows no inline styles).
+/* The CSP allows no inline styles and no fonts, so we use system fonts and
+   inline <svg> icons. The only image is the hero photo.
 
-   The CSP allows no fonts (no font-src, so default-src 'none'), and images
-   only from 'self', and only one is built in: the masthead photo. So the
-   type is the system's, and every icon is an inline <svg> in the page, never
-   a url() here. Status lines are set with textContent, which would remove
-   any child, so their markers are drawn below with pseudo-elements.
-
-   Colour is kept for meaning. Orange, the photo's tecoma, is the name and
-   the one action to take (upload, open, download). Green is success and
-   progress. Amber is the public-link warning. Red is an error or the §8
-   expiry warning. Everything else, the passphrase-protected mode included,
-   is ink on paper, so those keep their force. */
+   Colour always means something: orange is the name and the main button,
+   green is progress and success, amber is a public link, red is an error.
+   Everything else is ink on paper. */
 
 :root {
   color-scheme: light dark;
@@ -36,20 +29,17 @@
 
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
-  /* The wordmark: an old-style serif from the system (a vendored face would
-     need font-src and another built-in file). Iowan on Apple devices,
-     Palatino on Windows, its URW clone P052 on Linux, then Charter, Georgia. */
+  /* System serifs: Iowan (Apple), Palatino (Windows), P052 (Linux). */
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "P052", "URW Palladio L",
     "Book Antiqua", Charter, "Bitstream Charter", Georgia, serif;
-  /* Roughly 1.25 between steps, so a heading never looks like a value. */
   --t-label: 0.75rem;    /* 12: small caps labels, section numbers */
   --t-small: 0.875rem;   /* 14: hints, step details */
-  --t-body: 1rem;        /* 16 */
+  --t-body: 1rem;
   --t-value: 1.125rem;   /* 18: values, the active step */
   --t-heading: 1.375rem; /* 22: section titles */
   --t-title: 1.75rem;    /* 28: "Uploaded" */
   --radius: 12px;
-  --wide: 66rem;           /* the upload page on a wide screen */
+  --wide: 66rem;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -78,9 +68,8 @@
 
 * { box-sizing: border-box; }
 
-/* The page hides and shows with the hidden attribute, and each rule it keeps
-   depends on that (which kind of link is said, which steps are waiting). Any
-   `display` below would otherwise quietly override it. */
+/* The script shows and hides things with `hidden`. Without this, any
+   `display` rule below would quietly override it. */
 [hidden] { display: none !important; }
 
 body {
@@ -95,9 +84,7 @@ body {
 .masthead { padding-top: 2.5rem; padding-bottom: 2rem; }
 main { padding-bottom: 5rem; }
 
-/* Quiet by default, and always on the download page: someone there is
-   decrypting a file and reading warnings, so the name is just a name, in
-   the same face and colour as the upload page's, at a reading size. */
+/* A small, quiet name by default. The upload page enlarges it below. */
 h1 {
   margin: 0;
   font-family: var(--serif);
@@ -120,7 +107,6 @@ code { font-family: var(--mono); font-size: 0.92em; }
 
 .section { padding: 2.25rem 0; border-top: 1px solid var(--line); }
 #upload { counter-reset: decide; }
-/* The decisions, in the order they are made. */
 .decide h2 { display: flex; align-items: baseline; gap: 0.75rem; counter-increment: decide; }
 .decide h2::before {
   content: counter(decide, decimal-leading-zero);
@@ -134,7 +120,6 @@ code { font-family: var(--mono); font-size: 0.92em; }
 
 /* ---- controls: every tap target at least 44 px tall -------------------------- */
 
-/* Labels are small and set in capitals; what they label is larger. */
 .field {
   display: block;
   margin: 1.25rem 0 0.45rem;
@@ -150,7 +135,7 @@ input[type="text"], input[type="password"], select {
   width: 100%;
   min-height: 2.875rem;
   padding: 0.55rem 0.8rem;
-  font: inherit; /* 16 px: phones do not zoom into the field */
+  font: inherit; /* 16 px, so phones don't zoom in */
   color: inherit;
   background: var(--surface);
   border: 1px solid var(--line-strong);
@@ -160,12 +145,10 @@ input[type="text"], input[type="password"], select {
 input[type="text"]:hover, input[type="password"]:hover:not(:disabled), select:hover { border-color: var(--ink-2); }
 input:disabled { opacity: 0.45; cursor: not-allowed; }
 
-/* The native arrow, replaced by an inline one: a CSS url() icon is an image,
-   which the CSP refuses. */
+/* Our own arrow: the CSP blocks url() icons. */
 .select { position: relative; display: block; }
 .select select { appearance: none; padding-right: 2.5rem; cursor: pointer; }
 .select .chevron { position: absolute; right: 0.8rem; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
-/* The list itself keeps the platform's colours. */
 select option { color: initial; background: initial; }
 
 button {
@@ -195,9 +178,8 @@ button:disabled { opacity: 0.55; cursor: progress; }
 /* The mode wraps whole, never at its hyphen. */
 .button-mode { font-weight: 400; white-space: nowrap; }
 
-/* Focus: a ring set off from the control by a band of the page's colour, so
-   it reads on the ink button, the fields and the drop zone alike. The
-   transparent outline is what forced-colours mode draws instead. */
+/* A focus ring that shows on any background. The transparent outline is
+   what high-contrast mode draws instead. */
 :focus-visible, .drop:has(input:focus-visible) {
   outline: 2px solid transparent;
   outline-offset: 2px;
@@ -306,7 +288,7 @@ input:focus-visible, select:focus-visible { border-color: var(--focus); }
 .status[data-state="done"] { font-weight: 600; }
 .status[data-state="busy"] { color: var(--ink-2); font-weight: 400; }
 .status[data-state="done"] { color: var(--success); }
-/* A marker before the words, drawn here: the words are textContent. */
+/* Markers are pseudo-elements, because the text is set with textContent. */
 .status[data-state]::before {
   content: "";
   flex: none;
@@ -352,9 +334,6 @@ input:focus-visible, select:focus-visible { border-color: var(--focus); }
 
 /* ---- the named waits: the page's centrepiece --------------------------------- */
 
-/* A timeline: each wait a marker on a line, hollow until it starts, marked as
-   it ends. Only the running wait shows its bar, and why it takes as long as
-   it does. */
 .steps {
   list-style: none;
   margin: 1.25rem 0 0;
@@ -370,7 +349,7 @@ input:focus-visible, select:focus-visible { border-color: var(--focus); }
   padding-bottom: 1.1rem;
 }
 .steps li > :not(.step-mark) { grid-column: 2; min-width: 0; }
-/* The line to the next step, drawn only when one is shown after it. */
+/* The connecting line, only when a visible step follows. */
 .steps li:has(~ li:not([hidden]))::before {
   content: "";
   position: absolute;
@@ -424,7 +403,7 @@ input:focus-visible, select:focus-visible { border-color: var(--focus); }
 .steps li[data-state="active"] .step-detail { color: var(--ink-2); }
 .steps li[data-state="error"] .step-detail { color: var(--error); font-weight: 600; }
 
-/* A bar only for the wait under way: done and waiting steps say it in words. */
+/* Only the running step shows a bar. */
 .steps li:not([data-state="active"]) progress { display: none; }
 
 progress {
@@ -443,8 +422,7 @@ progress::-webkit-progress-bar { background: var(--line); border-radius: 99px; }
 progress::-webkit-progress-value { background: var(--success); border-radius: 99px; }
 progress::-moz-progress-bar { background: var(--success); border-radius: 99px; }
 
-/* A wait that cannot be measured. The stripe is painted by the main thread,
-   so it moves only while the page is really running. */
+/* No known length: a moving stripe. It only moves while the page is busy. */
 progress:indeterminate {
   background: linear-gradient(90deg, var(--line) 0 35%, var(--success) 35% 65%, var(--line) 65%) 0 0 / 300% 100%;
   animation: slide 1.4s linear infinite;
@@ -473,7 +451,7 @@ progress:indeterminate::-moz-progress-bar { background: transparent; }
   border-radius: 10px;
   word-break: break-all;
 }
-/* Weight, not colour: amber is taken, it means a public link. */
+/* A heavy border, not a colour: amber already means "public". */
 .token-box {
   margin-top: 1.5rem;
   padding: 1rem 1.1rem;
@@ -488,7 +466,7 @@ progress:indeterminate::-moz-progress-bar { background: transparent; }
 #unlock { margin-top: 1rem; }
 #unlock .field { margin-top: 0; }
 
-/* §8: the one server misbehaviour a recipient can see. Never subtle. */
+/* §8: a file served past its expiry. It should be impossible to miss. */
 #expired-warning {
   display: flex;
   gap: 0.7rem;
@@ -534,10 +512,8 @@ progress:indeterminate::-moz-progress-bar { background: transparent; }
 
 /* ---- the upload page's hero ------------------------------------------------- */
 
-/* The name and the tagline on the left, the photo beside them, never behind
-   them. Only on the upload page: the page shows #upload or #download by the
-   hidden attribute, so before the script decides, and on every download link,
-   the masthead stays quiet and the photo is never fetched. */
+/* Name on the left, photo on the right. Upload page only, so recipients
+   never download the photo. */
 body:has(> #upload:not([hidden])) .masthead {
   display: grid;
   grid-template-columns: minmax(0, 1fr) clamp(7rem, 34vw, 12rem);
@@ -558,8 +534,7 @@ body:has(> #upload:not([hidden])) .tagline {
   font-size: var(--t-value);
   line-height: 1.45;
 }
-/* A CSS background, not an <img>: a hidden <img> would still be fetched on
-   every download link. WebP where the browser says it can take it. */
+/* A background, not an <img>: a hidden <img> would still be downloaded. */
 body:has(> #upload:not([hidden])) .hero {
   display: block;
   width: 100%;
@@ -574,11 +549,8 @@ body:has(> #upload:not([hidden])) .hero {
 
 /* ---- the upload page on a wide screen ----------------------------------------- */
 
-/* Two columns under a full-width hero. On the left, what is sent and who is
-   sending it (the file, the upload token); on the right, who can open it and
-   for how long, then the button that says which kind of link it makes, and
-   what follows. Below the breakpoint the columns are plain blocks, and the
-   page is one column in the same order. Every note stays visible. */
+/* File and token on the left; who can open it, limits and the button on
+   the right. Narrower screens get one column in the same order. */
 @media (min-width: 60rem) {
   body:has(> #upload:not([hidden])) .masthead,
   #upload { max-width: var(--wide); }

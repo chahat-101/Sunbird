@@ -1,5 +1,5 @@
-//! The built binary, run in a directory holding nothing but its data, over a
-//! real socket.
+//! Tests of the built binary, over a real socket, in a directory holding only
+//! its data.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -149,8 +149,7 @@ impl Running {
         v["id"].as_str().unwrap().to_owned()
     }
 
-    /// Starts downloading `id`: the connection, with the response head read
-    /// and the body not yet.
+    /// Starts downloading `id`: response head read, body not yet.
     fn start_download(&self, id: &str) -> TcpStream {
         let mut conn = TcpStream::connect(&self.addr).unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(60)))
@@ -198,9 +197,8 @@ fn exchange(addr: &str, head: &str) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
-/// The client is built into the binary: the page, at / and at a link's path,
-/// and every file it loads, served byte for byte from a directory with no
-/// web/ in it.
+/// The client is built in: every page and file it loads is served byte for
+/// byte, with no web/ directory present.
 #[test]
 fn serves_the_built_in_page() {
     let s = start();
@@ -238,9 +236,8 @@ fn serves_the_built_in_page() {
     }
 }
 
-/// SIGTERM: the listener closes at once, a download in progress is given time
-/// to finish and does, and the process exits cleanly, having saved the
-/// counters, which the next start carries on from.
+/// SIGTERM: stop listening, let a download in progress finish, save the
+/// counters, exit cleanly. The next start carries on counting.
 #[test]
 fn sigterm_finishes_transfers_and_keeps_the_counters() {
     let mut s = start();
@@ -276,14 +273,12 @@ fn sigterm_finishes_transfers_and_keeps_the_counters() {
     );
 }
 
-/// A transfer still going when the grace period ends is cut off, and the
-/// process still exits cleanly: the download is refunded, counted as failed,
-/// and saved, so the file can be downloaded after the restart.
+/// A transfer still running after the grace period is cut off and refunded,
+/// and the process still exits cleanly.
 #[test]
 fn sigterm_cuts_off_a_stalled_transfer_after_the_grace_period() {
     let mut s = start();
-    // Larger than loopback's socket buffers, so the server cannot finish
-    // writing it to a client that has stopped reading.
+    // Bigger than loopback's socket buffers, so the write can't finish.
     let blob = random_blob(64 << 20);
     let id = s.upload(&blob, 1);
     let stalled = s.start_download(&id);
@@ -325,8 +320,7 @@ fn stats_need_the_admin_token() {
     assert_eq!(s.stats()["uploads"].as_u64(), Some(0));
 }
 
-/// A declared length over max_blob is answered without a byte of the body
-/// sent, and the connection is not kept open to drain one.
+/// A declared length over max_blob is refused before any body is sent.
 #[test]
 fn declared_length_over_max_blob_refused_before_the_body() {
     let s = start();
@@ -374,9 +368,8 @@ fn declared_length_over_max_blob_refused_before_the_body() {
     );
 }
 
-/// The sweeper runs at startup, not only once its first interval has passed: a
-/// file that expired while the server was down is deleted with no request for
-/// it, blob and row.
+/// The sweeper runs at startup, deleting files that expired while the server
+/// was down.
 #[test]
 fn sweeps_at_startup() {
     let blob = |data: &Path| data.join("blobs/000000000000000000000000");
@@ -417,8 +410,7 @@ fn sweeps_at_startup() {
     assert_eq!(rows, 0, "the expired row");
 }
 
-/// Without a config the server does not start: it has no members, and no
-/// limits of its own to fall back on.
+/// No config, no start: there are no default members or limits.
 #[test]
 fn refuses_to_start_without_a_config() {
     let dir = std::env::temp_dir().join(format!("sunbird-binary-noconfig-{}", std::process::id()));
@@ -434,8 +426,7 @@ fn refuses_to_start_without_a_config() {
     assert!(err.contains("sunbird.json"), "{err}");
 }
 
-/// mint-token prints a 128-bit base64url token once, and the SHA-256 that
-/// goes in the config; mint-id prints an id, and nothing about a token.
+/// mint-token prints a token once plus its SHA-256; mint-id prints only an id.
 #[test]
 fn mints_tokens_and_ids() {
     let run = |sub: &str| {

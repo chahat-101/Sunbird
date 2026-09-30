@@ -1,6 +1,5 @@
-//! The data directory — sunbird.db, blobs/<hex id>, and tmp/ for uploads in
-//! progress — and the values a request carries, each checked once, at the edge,
-//! into a type that cannot hold anything else.
+//! The data directory (sunbird.db, blobs/, tmp/) and the request values, each
+//! checked once at the edge into a type that can't hold anything else.
 
 use std::fs::{self, DirBuilder};
 use std::io::ErrorKind;
@@ -20,13 +19,11 @@ use crate::counters::{Counter, Counters};
 use crate::db::{Db, Error, Usage};
 use crate::limit::Limiter;
 
-/// max_blob from protocol.md §6.4: 8,192 + 1601 × 65,536. The only format
-/// limit the server knows, and a plain byte count.
+/// max_blob (§6.4): 8,192 + 1601 × 65,536. The one format limit the server knows.
 pub const MAX_BLOB: u64 = 104_931_328;
 /// The preview from §3: the first min(8192, size) bytes, unparsed.
 pub const PREVIEW_LEN: u64 = 8192;
-/// D9's 7 day maximum. An expires_at further ahead than this is refused, never
-/// clamped (§10).
+/// The 7-day maximum. Anything later is refused, not clamped (§10).
 const MAX_LIFETIME: u64 = 7 * 24 * 3600;
 
 fn random<const N: usize>() -> [u8; N] {
@@ -35,8 +32,8 @@ fn random<const N: usize>() -> [u8; N] {
     b
 }
 
-/// A file's ID (§2): 96 random bits, 16 base64url characters. Every one has
-/// exactly one spelling, and none contains path syntax.
+/// A file ID (§2): 96 random bits as 16 base64url characters. One spelling
+/// each, and never path syntax.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileId([u8; 12]);
 
@@ -45,9 +42,8 @@ impl FileId {
         FileId(random())
     }
 
-    /// Accepts exactly what `random` produces: 16 characters of the base64url
-    /// alphabet, no padding. 16 characters are 96 bits with none spare, so
-    /// there is no second spelling to reject.
+    /// Accepts exactly what `random` produces. 16 characters are exactly 96 bits,
+    /// so there's no second spelling.
     pub fn parse(s: &str) -> Option<Self> {
         if s.len() != 16 {
             return None;
@@ -55,9 +51,8 @@ impl FileId {
         URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok().map(FileId)
     }
 
-    /// The name of the blob on disk: the ID's bytes in hex. base64url is
-    /// case-sensitive, and two IDs differing only in case must not be one file
-    /// on a case-insensitive filesystem.
+    /// The blob's file name: the ID in hex, so IDs that differ only in case can't
+    /// collide on a case-insensitive filesystem.
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -86,8 +81,7 @@ impl std::fmt::Display for FileId {
     }
 }
 
-/// The owner token handed back once at upload: 256 random bits. The server
-/// keeps only its hash, so there is no way to get one back from a `FileId`.
+/// The owner token, shown once at upload. The server keeps only its hash.
 pub struct OwnerToken(String);
 
 impl OwnerToken {
@@ -104,9 +98,8 @@ impl OwnerToken {
     }
 }
 
-/// SHA-256 of an owner token's text: what the database holds instead of the
-/// token. SHA-256 rather than a slow hash because the token is 256 random
-/// bits; there is nothing to guess. The only comparison is `matches`.
+/// SHA-256 of an owner token. A fast hash is fine: the token is 256 random
+/// bits, so there's nothing to guess.
 #[derive(Clone, Copy)]
 pub struct OwnerTokenHash([u8; 32]);
 
@@ -123,22 +116,15 @@ impl OwnerTokenHash {
         &self.0
     }
 
-    /// Whether `token` hashes to this, in constant time. Hashing first means
-    /// the comparison could not leak the token's bytes anyway; comparing in
-    /// constant time means it leaks nothing about the stored hash either.
+    /// Constant-time comparison, so nothing leaks about the stored hash.
     pub fn matches(&self, token: &str) -> bool {
         Self::of(token).0.ct_eq(&self.0).into()
     }
 }
 
-/// The limits an upload carries beside its blob (§10). They must be the values
-/// the client sealed into the header; the server cannot check that, and cannot
-/// read the header (§3). Out-of-range values are refused, not adjusted: the
-/// header cannot be rewritten, and an adjusted row would promise something the
-/// verified header does not.
-///
-/// The first limit reached wins: past expires_at, or max_downloads completed
-/// (0: no download limit), the file is gone.
+/// The limits sent beside the blob (§10). The server can't check them against
+/// the sealed header, so out-of-range values are refused, never adjusted.
+/// Whichever limit is reached first removes the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub expires_at: i64,
@@ -160,8 +146,7 @@ impl Limits {
         let max_downloads = once("max_downloads")
             .and_then(decimal::<u32>)
             .ok_or("max_downloads must be given once, as a decimal integer from 0 to 4294967295")?;
-        // The file is expired once the clock reaches expires_at. Accepting one
-        // already there would store a file that 404s.
+        // Refuse a file that would already be expired.
         let now = u64::try_from(now).expect("the clock is before 1970");
         if expires_at <= now {
             return Err(
@@ -180,8 +165,8 @@ impl Limits {
     }
 }
 
-/// Canonical decimal only: digits, no sign, no leading zero, no percent
-/// escapes, so each number has one spelling. Out of range is refused.
+/// Canonical decimal only (no sign, leading zeros or escapes), so each number
+/// has one spelling.
 fn decimal<T: std::str::FromStr>(s: &str) -> Option<T> {
     let canonical =
         !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
@@ -201,8 +186,7 @@ pub struct App {
     /// Previews and downloads, per client address (an IPv6 /64).
     pub read_limit: Limiter<IpAddr>,
     pub counters: Counters,
-    /// Bytes free to an unprivileged process on the filesystem holding `dir`.
-    /// Tests replace it.
+    /// Free bytes for a non-root process on `dir`'s filesystem. Tests replace it.
     pub free_space: fn(&Path) -> std::io::Result<u64>,
 }
 
@@ -213,14 +197,13 @@ fn system_clock() -> i64 {
         .as_secs() as i64
 }
 
-/// statvfs's f_bavail: the blocks root's reserve does not count, since the
-/// server does not run as root.
+/// statvfs's f_bavail: excludes root's reserve, since we don't run as root.
 fn statvfs_free(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is a NUL-terminated string that outlives the call, and
-    // `st` is written by statvfs before it is read, only when it returns 0.
+    // SAFETY: `path` is NUL-terminated and outlives the call; `st` is only read
+    // after statvfs returns 0.
     let st = unsafe {
         if libc::statvfs(path.as_ptr(), st.as_mut_ptr()) != 0 {
             return Err(std::io::Error::last_os_error());
@@ -233,11 +216,9 @@ fn statvfs_free(path: &Path) -> std::io::Result<u64> {
 }
 
 impl App {
-    /// Creates the layout if needed, opens and migrates the database, and
-    /// clears what a previous process left behind: partial uploads in tmp/,
-    /// download claims still in flight, and blobs with no row.
-    ///
-    /// It does not sweep: `sweep` judges by `now`, which a test sets after this.
+    /// Creates the layout, opens and migrates the database, and cleans up after a
+    /// previous process: partial uploads, claims in flight, blobs with no row.
+    /// It doesn't sweep; tests set `now` first.
     pub fn open(dir: &Path, config: Config) -> Result<App, Error> {
         for sub in ["blobs", "tmp"] {
             DirBuilder::new()
@@ -256,8 +237,7 @@ impl App {
                 "refunded downloads left in flight by the previous process, on {refunded} files"
             );
         }
-        // Loaded, not written: nothing is saved until the first timer or the
-        // shutdown, so opening a directory changes none of its rows.
+        // Loaded, not written, so just opening a directory changes nothing.
         let counters = Counters::load(&db.counters()?, system_clock());
         let app = App {
             dir: dir.to_owned(),
@@ -274,8 +254,7 @@ impl App {
     }
 
     pub fn db(&self) -> MutexGuard<'_, Db> {
-        // A panic mid-statement leaves no transaction open: rusqlite rolls back
-        // on drop. The connection is still good.
+        // rusqlite rolls back on drop, so a panic leaves the connection usable.
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -296,10 +275,8 @@ impl App {
         Ok(self.db().usage(member, (self.now)())?)
     }
 
-    /// Whether `more` bytes can still be written and leave min_free_bytes
-    /// free. Checked before an upload's body with its declared length, and
-    /// again as it streams with what is left of it: parallel uploads each pass
-    /// the first check alone.
+    /// Whether `more` bytes fit above min_free_bytes. Checked before the body and
+    /// again while it streams.
     pub fn disk_has_room(&self, more: u64) -> std::io::Result<bool> {
         let free = (self.free_space)(&self.dir.join("tmp"))?;
         Ok(free >= self.config.min_free_bytes.saturating_add(more))
@@ -310,11 +287,9 @@ impl App {
         self.db().save_counters(&self.counters.rows())
     }
 
-    /// Gives a completed upload its ID, recorded as `uploader`'s, if their
-    /// quota has room: Ok(Err) is the refusal. The hard link fails if the name
-    /// is taken, so an ID collision never overwrites a blob; a rename would.
-    /// The file comes before the row: a crash in between leaves a file nothing
-    /// refers to, which the next `open` removes, never a row with no file.
+    /// Gives a finished upload its ID if the quota allows (Ok(Err) is a refusal).
+    /// A hard link never overwrites an existing blob. File before row: a crash
+    /// leaves an orphan file, which the next `open` removes.
     pub fn commit(
         &self,
         tmp: &Path,
@@ -362,18 +337,13 @@ impl App {
         Err(taken.map_or_else(|| "no ID to try".into(), Into::into))
     }
 
-    /// Deletes a file already marked deleting: the blob, then the row. The mark
-    /// came first, so the file stopped being served before any bytes went.
+    /// Deletes a marked file: blob, then row. It stopped being served when marked.
     ///
-    /// The deletion is verified: after the unlink, the blob must be gone from
-    /// the directory, and that check, not what the unlink returned, decides.
-    /// If the blob is still there, or the check itself fails, it is logged as
-    /// an error and the row stays marked, never served again, for the next
-    /// sweep to retry. A crash between the steps leaves the same state.
+    /// The deletion is verified by checking the blob is really gone. If not, it's
+    /// logged as an error and left marked for the next sweep.
     ///
-    /// A download still streaming the blob is not stopped. On POSIX an unlinked
-    /// file lives on for the descriptors already open on it, so that transfer
-    /// completes and then the bytes go. Nothing locks against that.
+    /// A download already streaming finishes: on POSIX the open file keeps its
+    /// bytes until closed.
     pub fn purge(&self, id: &FileId) -> Result<(), Error> {
         let path = self.blob_path(id);
         let unlinked = fs::remove_file(&path);
@@ -402,11 +372,9 @@ impl App {
         }
     }
 
-    /// An admin's deletion, for revoking a file or answering a takedown: any
-    /// file with a row, including one expired or used up but not yet swept.
-    /// False if there is no such file. It is marked and purged as the sweeper
-    /// does, so the deletion is verified, and it is logged naming the admin,
-    /// the file and the uploader, whether it succeeds or fails.
+    /// An admin deletion (revocation or takedown). Works on any file with a row,
+    /// even one expired but not yet swept. Verified like the sweeper's, and logged
+    /// with the admin, the file and the uploader.
     pub fn admin_delete(&self, admin: &Admin, id: &FileId) -> Result<bool, Error> {
         // Bound first, as in `end_download`: `purge` locks the database again.
         let uploader = {
@@ -439,8 +407,7 @@ impl App {
         }
     }
 
-    /// Ends a download claimed with `Db::claim`, counted if `completed` and
-    /// refunded if not, and purges the file if that used it up.
+    /// Ends a claimed download and purges the file if that used it up.
     pub fn end_download(&self, id: &FileId, completed: bool) {
         self.counters.add(
             match completed {
@@ -449,26 +416,21 @@ impl App {
             },
             1,
         );
-        // Bound first: a guard in the match would be held into `purge`, which
-        // locks the database again, and deadlock.
+        // Bind first: a guard in the match would still hold the lock in `purge`.
         let ended = self.db().end_download(id, completed);
         match ended {
             Ok(true) => {
                 let _ = self.purge(id); // logged; the sweeper retries
             }
             Ok(false) => {}
-            // The claim stays in flight: the file is not purged, and a refund
-            // waits for the next start.
+            // Leave the claim in flight; the next start refunds it.
             Err(e) => log::error!("file {id}: could not record the end of a download: {e}"),
         }
     }
 
-    /// Deletes every file past its limits, and retries every earlier deletion
-    /// that failed. Marks first, so the files stop being served, then purges.
-    /// Returns how many were deleted and how many could not be.
-    ///
-    /// Also prunes the upload ledger of entries past the 7 days, which no
-    /// quota can count again.
+    /// Deletes every file past its limits and retries earlier failures, marking
+    /// first so they stop being served. Also prunes the ledger. Returns (deleted,
+    /// failed).
     pub fn sweep(&self) -> Result<(usize, usize), Error> {
         let now = (self.now)();
         let marked = {
@@ -488,8 +450,7 @@ impl App {
         Ok((marked.len() - failed, failed))
     }
 
-    /// Deletes blobs with no row: an upload linked its file and the process
-    /// stopped before the insert. Nothing could ever serve such a file. Runs
+    /// Deletes blobs with no row, left by a crash between link and insert. Runs
     /// before any upload can be mid-commit.
     fn remove_orphans(&self) -> Result<(), Error> {
         for entry in fs::read_dir(self.dir.join("blobs"))? {
@@ -540,8 +501,7 @@ mod tests {
         );
     }
 
-    /// Each ID has one spelling: base64url only, 16 characters, no padding.
-    /// Decoding the standard alphabet too would give one blob two names.
+    /// One spelling per ID: base64url only, 16 characters, no padding.
     #[test]
     fn one_spelling_per_id() {
         assert!(
@@ -560,8 +520,8 @@ mod tests {
         }
     }
 
-    /// A file is named by its ID in hex, so two IDs that differ only in case are
-    /// two files on a case-insensitive filesystem too.
+    /// IDs that differ only in case are separate files, even on a
+    /// case-insensitive filesystem.
     #[test]
     fn blob_names_are_hex() {
         let a = FileId::parse("AAAAAAAAAAAAAAAA").unwrap();
@@ -571,8 +531,8 @@ mod tests {
         assert_eq!(FileId::from_hex(&b.hex()), Some(b));
     }
 
-    /// An ID that is already taken is never overwritten: the link fails, and the
-    /// next ID is tried. With none left, the upload fails and nothing changes.
+    /// A taken ID is never overwritten: the next one is tried, and with none left
+    /// the upload fails cleanly.
     #[tokio::test]
     async fn id_collision_never_overwrites() {
         let s = server();
@@ -617,10 +577,8 @@ mod tests {
         assert_eq!(rows(&s), 2);
     }
 
-    /// The crash points, reconstructed on disk, then a restart: a blob linked but
-    /// never given a row, a download claimed whose transfer never ended, and a
-    /// row marked deleting whose blob was not yet unlinked, which the first sweep
-    /// finishes.
+    /// Crash points recreated on disk, then a restart: an orphan blob, an
+    /// unfinished claim, and a half-deleted file the first sweep finishes.
     #[tokio::test]
     async fn restart_after_crash() {
         let s = server();
@@ -705,9 +663,7 @@ mod tests {
 
     const T0: i64 = 1_800_000_000;
 
-    /// The sweeper deletes a file past expires_at that nobody asks for again:
-    /// blob, then row, and the blob is checked gone. Files within their limits
-    /// stay.
+    /// The sweeper deletes expired files (checked gone) and leaves the rest.
     #[tokio::test]
     async fn sweep_deletes_expired() {
         static CLOCK: AtomicI64 = AtomicI64::new(T0);
@@ -743,8 +699,7 @@ mod tests {
         assert_eq!((rows(&s), entries(&s, "blobs")), (2, 2));
     }
 
-    /// Restores a directory's permissions when the test ends, pass or fail, so
-    /// it can be removed.
+    /// Restores permissions after the test so the directory can be removed.
     struct Writable(std::path::PathBuf);
 
     impl Drop for Writable {
@@ -753,9 +708,8 @@ mod tests {
         }
     }
 
-    /// A deletion that fails is logged as an error, every time it is tried, and
-    /// the file stays marked, never served, until one succeeds. Forced here with
-    /// a blobs directory that refuses the unlink.
+    /// A failed deletion is logged every time and the file stays unserved until
+    /// one succeeds. Forced with a blobs directory that refuses the unlink.
     #[tokio::test]
     async fn failed_deletion_is_logged_and_retried() {
         static CLOCK: AtomicI64 = AtomicI64::new(T0);

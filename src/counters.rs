@@ -1,38 +1,34 @@
-//! The numbers the server keeps about itself: totals only, never which file or
-//! which member. In memory, and saved to the `counters` table on a timer and
-//! at shutdown, so a restart does not lose them. A crash loses what changed
-//! since the last save.
+//! The server's own counts: totals only, never a file or a member. Kept in
+//! memory and saved on a timer and at shutdown; a crash loses changes since the
+//! last save.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// the ones schema version 5 already stored (tests/fixtures/schema-v5), so a
-/// database written before this rewrite carries on counting.
+/// Each counter, named as in the `counters` table. The names match schema 5
+/// (tests/fixtures/schema-v5), so older databases keep counting.
 #[derive(Clone, Copy, Debug)]
 pub enum Counter {
     /// Files stored.
     Uploads,
     /// Blob bytes of the files stored.
     BytesUploaded,
-    /// Downloads whose last byte the server handed to the connection. Not
-    /// files anyone received: see the README.
+    /// Downloads whose last byte was handed to the connection, not necessarily
+    /// received (see deploy/README).
     Downloads,
     /// Downloads claimed and then not completed, so refunded.
     FailedDownloads,
-    /// Uploads by a member, within their limits, that stored nothing: the
-    /// client went away, the server failed (a full disk included), or
-    /// shutdown cut them off.
+    /// Uploads within the member's limits that stored nothing: the client left,
+    /// the server failed, or shutdown cut them off.
     FailedUploads,
     /// Files the sweeper deleted after their expiry time.
     ExpiredSwept,
-    /// Deletions that failed, one per attempt: a stuck file adds one every
-    /// sweep until it goes.
+    /// Failed deletions, one per attempt.
     DeletionFailures,
     /// Uploads refused with 429 by the per-member limit.
     RateLimitedUploads,
     /// Previews and downloads refused with 429 by the per-address limit.
     RateLimitedReads,
-    /// Uploads refused with 507 at the free-space floor, before or during the
-    /// body.
+    /// Uploads refused (507) at the free-space floor.
     UploadsRefusedLowDisk,
 }
 
@@ -76,9 +72,8 @@ pub struct Counters {
 }
 
 impl Counters {
-    /// The totals in `stored` (name, value) rows, carried on. With no
-    /// counting_since row, counting begins at `now`. Rows this version does
-    /// not know are left alone.
+    /// Loads saved totals. With no counting_since, counting starts at `now`.
+    /// Unknown rows are left alone.
     pub fn load(stored: &[(String, i64)], now: i64) -> Counters {
         let get = |name: &str| {
             stored
@@ -100,9 +95,8 @@ impl Counters {
         self.values[counter as usize].load(Ordering::Relaxed)
     }
 
-    /// Every counter, then counting_since, as rows to save. Each value is read
-    /// once; saving writes them whole, not as increments, so a save that runs
-    /// twice counts nothing twice.
+    /// Every counter plus counting_since, as rows. Saved whole, not as
+    /// increments, so saving twice never double-counts.
     pub fn rows(&self) -> Vec<(&'static str, i64)> {
         ALL.iter()
             .map(|&c| (c.name(), self.get(c) as i64))

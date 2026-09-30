@@ -1,7 +1,5 @@
-//! The config file: who may upload, how much each member may store, the rate
-//! limits, and which proxies to believe. Every limit is required. The binary
-//! carries no numbers of its own: a limit left out is an error, never a
-//! default.
+//! The config file: members, quotas, rate limits and trusted proxies. Every
+//! limit is required; a missing one is an error, never a default.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -14,10 +12,9 @@ use subtle::{ConditionallySelectable, ConstantTimeEq};
 
 use crate::db::{Error, Usage};
 
-/// A person's id: 128 random bits as 22 base64url characters, minted once by
-/// `sunbird mint-id`. Rows store it, never the display name, so a rename keeps
-/// a member's files and quota, and a new member given a departed member's name
-/// starts with nothing of theirs. Reissuing a token does not change it.
+/// A person's id: 128 random bits, minted once by `sunbird mint-id`. Rows store
+/// the id, not the name, so renames keep files and quota, and a new token keeps
+/// the same id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MemberId(String);
 
@@ -49,8 +46,8 @@ fn random16() -> [u8; 16] {
     b
 }
 
-/// A new upload or admin token, for `sunbird mint-token`: 128 bits from the
-/// OS, base64url. The server never makes one; it only ever sees the hash.
+/// A new token for `sunbird mint-token`: 128 random bits, base64url. The
+/// server only ever sees its hash.
 pub fn mint_token() -> String {
     URL_SAFE_NO_PAD.encode(random16())
 }
@@ -63,17 +60,15 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// What one member may have. Blob bytes on disk, as the server stores them:
-/// it keeps no format knowledge, so noise costs exactly what a real file does.
+/// What one member may have, counted in blob bytes on disk.
 #[derive(Clone, Debug)]
 pub struct Quota {
     /// Bytes of live files at once: freed when a file expires or is deleted.
     pub max_active_bytes: u64,
     /// Live files at once.
     pub max_active_files: u64,
-    /// Bytes uploaded in any 7 days, counted from the upload ledger, which
-    /// deleting a file never touches. Otherwise upload, delete, repeat would
-    /// defeat it.
+    /// Bytes uploaded in any 7 days, from the ledger, so deleting a file doesn't
+    /// refund it.
     pub max_bytes_per_week: u64,
 }
 
@@ -104,22 +99,19 @@ pub struct Rate {
 pub struct Config {
     pub members: Vec<Member>,
     pub admins: Vec<Admin>,
-    /// Proxies whose X-Forwarded-For entries are believed. Empty: the header
-    /// is ignored, and the socket address is the client.
+    /// Proxies whose X-Forwarded-For we believe. Empty: ignore the header.
     pub trusted_proxies: Vec<IpAddr>,
     /// Per member id.
     pub upload_rate: Rate,
     /// Preview and download, per client address.
     pub read_rate: Rate,
-    /// Free space on the data directory's filesystem below which uploads are
-    /// refused. Quotas bound each member, not the disk: this bounds the disk.
+    /// Uploads are refused below this much free space. Quotas limit members; this
+    /// limits the disk.
     pub min_free_bytes: u64,
 }
 
-/// The entry in `entries` whose token hashes to `token`'s hash. Every entry is
-/// compared, each in constant time, and the answer is selected without a
-/// branch: how long this takes depends on how many entries there are, not on
-/// which one matched or how much of a hash did.
+/// Finds the entry whose token matches, comparing every entry in constant time
+/// and picking the answer without branching, so timing reveals nothing.
 fn find<'a, T>(entries: &'a [T], hash: impl Fn(&T) -> &[u8; 32], token: &str) -> Option<&'a T> {
     let presented = token_sha256(token);
     find_hash(entries, hash, &presented)
@@ -143,8 +135,7 @@ impl Config {
         find(&self.members, |m| &m.token_sha256, token)
     }
 
-    /// The admin an admin token belongs to. Admin tokens are checked against
-    /// the admins only: a member's token never deletes someone else's file.
+    /// Admin tokens are checked against admins only.
     pub fn admin(&self, token: &str) -> Option<&Admin> {
         find(&self.admins, |a| &a.token_sha256, token)
     }
@@ -229,8 +220,8 @@ impl Config {
             trusted_proxies.push(address.to_canonical());
         }
 
-        // One id is one person, so it appears once per list. A person who is
-        // both a member and an admin keeps one id in both.
+        // One id per person per list. Someone who is both member and admin keeps the
+        // same id in both.
         for (list, ids) in [
             ("members", members.iter().map(|m| &m.id).collect::<Vec<_>>()),
             ("admins", admins.iter().map(|a| &a.id).collect()),
@@ -241,8 +232,7 @@ impl Config {
                 }
             }
         }
-        // A token that opened two entries would make an upload or a deletion
-        // belong to either.
+        // A token matching two entries would make ownership ambiguous.
         let hashes: Vec<_> = members
             .iter()
             .map(|m| (&m.token_sha256, &m.id))
@@ -268,9 +258,8 @@ impl Config {
 }
 
 impl Quota {
-    /// Whether one more upload of `size` bytes fits beside `usage`. Refused,
-    /// the message names the limit hit and when waiting frees enough, for the
-    /// member to read.
+    /// Whether one more upload of `size` fits. A refusal names the limit and when
+    /// it frees up.
     pub fn admit(&self, usage: &Usage, size: u64, now: i64) -> Result<(), String> {
         let files = usage.files.len() as u64;
         if files >= self.max_active_files {
@@ -336,8 +325,7 @@ impl Quota {
     }
 }
 
-/// When enough of `entries`, (size, time) in the order they free, has freed
-/// to cover `need` bytes: each frees at its time plus `after`.
+/// When enough of `entries` (size, time) frees up to cover `need` bytes.
 fn frees_at(entries: &[(u64, i64)], need: u64, after: i64) -> Option<i64> {
     let mut freed = 0u64;
     for &(size, at) in entries {
@@ -377,8 +365,7 @@ fn object<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String
     v.as_object().ok_or(format!("{what}: a JSON object"))
 }
 
-/// Refuses keys this version does not read: a misspelt limit must not pass
-/// for an absent one.
+/// Refuse unknown keys, so a misspelt limit isn't mistaken for a missing one.
 fn known(o: &Map<String, Value>, what: &str, keys: &[&str]) -> Result<(), String> {
     match o.keys().find(|k| !keys.contains(&k.as_str())) {
         Some(k) => Err(format!("{what}: unknown key {k:?}")),
@@ -494,8 +481,7 @@ pub(crate) mod tests {
         assert!(!c.members.is_empty() && !c.admins.is_empty());
     }
 
-    /// Every limit is required: leaving one out is an error naming it, never a
-    /// default the binary picked.
+    /// Every limit is required: a missing one is an error naming it.
     #[test]
     fn every_limit_is_required() {
         for key in ["max_active_bytes", "max_active_files", "max_bytes_per_week"] {
@@ -585,12 +571,9 @@ pub(crate) mod tests {
         assert!(id != MemberId::mint());
     }
 
-    /// The comparison is the constant-time one, and it compares whole hashes:
-    /// stored hashes that differ from the presented one only in their first
-    /// byte, only in their last, or in one bit, match nothing; the exact one
-    /// matches wherever it stands in the list. This checks the answers, not the
-    /// timing. That comes from `subtle`, and from `find_hash` visiting every
-    /// entry and selecting the answer without a branch.
+    /// Whole hashes are compared: hashes differing in the first byte, the last
+    /// byte or one bit match nothing. (Timing comes from `subtle` and `find_hash`;
+    /// this checks the answers.)
     #[test]
     fn token_lookup_compares_whole_hashes() {
         let presented = token_sha256("the token");

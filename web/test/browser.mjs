@@ -1,6 +1,5 @@
-// Drives headless Firefox (WebDriver BiDi) or Chromium (DevTools protocol)
-// with nothing but Node 22's built-in WebSocket. Shared by run.mjs and e2e.mjs.
-// The browser binary is found by findBrowser, below.
+// Drives headless Firefox (WebDriver BiDi) or Chromium (DevTools) using only
+// Node 22's WebSocket. Shared by run.mjs and e2e.mjs.
 import { spawn } from 'node:child_process';
 import { accessSync, constants, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -13,8 +12,7 @@ const PATH_NAMES = {
   chromium: ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'chrome'],
 };
 
-// Inside a Playwright browser directory (chromium_headless_shell-<rev> or
-// chromium-<rev>), where each platform's build keeps its binary.
+// Where a Playwright Chromium directory keeps its binary.
 const PLAYWRIGHT_BINARIES = [
   'chrome-headless-shell-linux64/chrome-headless-shell',
   'chrome-headless-shell-mac-arm64/chrome-headless-shell',
@@ -37,16 +35,9 @@ function executable(path) {
   }
 }
 
-// The binary for `browser`, in this order, first found wins:
-//   1. $BROWSER, if set (and then nothing else is tried);
-//   2. PATH: firefox; or chromium, chromium-browser, google-chrome,
-//      google-chrome-stable, chrome;
-//   3. Chromium only, Playwright's caches: $PLAYWRIGHT_BROWSERS_PATH,
-//      ~/.cache/ms-playwright, ~/Library/Caches/ms-playwright,
-//      %LOCALAPPDATA%\ms-playwright. The headless shell first, then full
-//      Chromium, newest revision first. (Playwright's Firefox is patched and
-//      does not speak WebDriver BiDi the way this driver needs.)
-// Throws, naming every place it looked, when nothing is found.
+// Finds the browser binary: $BROWSER if set, else PATH, else (Chromium only)
+// Playwright's caches, newest first. Playwright's Firefox isn't used: its
+// BiDi support differs. Throws, listing every place it looked.
 export function findBrowser(browser) {
   if (process.env.BROWSER) {
     if (executable(process.env.BROWSER)) return process.env.BROWSER;
@@ -91,12 +82,9 @@ export function findBrowser(browser) {
   throw new Error(`no ${browser} found. Looked for: ${looked.join('; ')}.${install}`);
 }
 
-// Returns { navigate(url), evaluate(expression), preload(functionSource),
-// viewport(width, height), close() }. evaluate awaits a promise result and
-// returns it by value. preload runs the function in every page loaded
-// afterwards, before the page's scripts. viewport sets a phone-sized window
-// (device pixel ratio 3; in Chromium also mobile layout and touch), and
-// viewport(null) restores the default.
+// Returns { navigate, evaluate, preload, viewport, close }. preload runs in
+// every later page before its scripts. viewport(w, h) emulates a phone at
+// 3× DPR; viewport(null) resets.
 export async function launch(browser) {
   if (browser !== 'firefox' && browser !== 'chromium') throw new Error(`unknown browser ${browser}`);
   const binary = findBrowser(browser);
