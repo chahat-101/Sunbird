@@ -13,10 +13,14 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 use crate::app::{App, FileId, Limits, MAX_BLOB, OwnerToken, PREVIEW_LEN};
+use crate::config::{MemberId, mint_token, token_sha256};
 use crate::counters::Counter;
+use crate::db::Registration;
+use crate::google::{SigninError, query_value};
 use crate::limit;
 
 pub type Body = BoxBody<Bytes, io::Error>;
@@ -28,7 +32,7 @@ pub enum ApiError {
     NotFound,
     NoOwnerToken,
     WrongOwnerToken,
-    /// No upload token, or one no member in the config has.
+    /// No upload token, or one no member has (banned members have none).
     NotAMember,
     /// No admin token, or one no admin in the config has.
     NotAnAdmin,
@@ -141,19 +145,7 @@ where
     match *req.method() {
         Method::POST if path == "/api/upload" => upload(app, req).await,
         _ if get && (path.starts_with("/api/meta/") || path.starts_with("/api/download/")) => {
-            // Count every request before parsing the ID, so the limit reveals nothing
-            // about which IDs exist.
-            let client = limit::client(
-                peer,
-                req.headers().get_all("x-forwarded-for").iter(),
-                &app.config.trusted_proxies,
-            );
-            app.read_limit
-                .check(limit::bucket(client))
-                .map_err(|wait| {
-                    app.counters.add(Counter::RateLimitedReads, 1);
-                    ApiError::RateLimited(wait)
-                })?;
+            limit_read(&app, peer, req.headers())?;
             match path.strip_prefix("/api/meta/") {
                 Some(id) => serve(app, id, PREVIEW_LEN, false).await,
                 None => {
@@ -163,7 +155,19 @@ where
                 }
             }
         }
+        _ if get && path == "/auth/google" => {
+            limit_read(&app, peer, req.headers())?;
+            Ok(signin_start(&app))
+        }
+        _ if get && path == "/auth/google/callback" => {
+            limit_read(&app, peer, req.headers())?;
+            Ok(signin_finish(app, req.uri().query()).await)
+        }
         _ if get && path == "/admin/stats" => stats(&app, bearer(&req)),
+        Method::POST if path.starts_with("/api/admin/ban/") => {
+            let token = bearer(&req).map(str::to_owned);
+            admin_ban(app, &path["/api/admin/ban/".len()..], token).await
+        }
         Method::DELETE if path.starts_with("/api/admin/") => {
             let token = bearer(&req).map(str::to_owned);
             admin_delete(app, &path["/api/admin/".len()..], token).await
@@ -175,6 +179,19 @@ where
         _ if get => client_file(path).ok_or(ApiError::NotFound),
         _ => Err(ApiError::NotFound),
     }
+}
+
+/// Counted before anything else is read, so the limit reveals nothing about IDs.
+fn limit_read(app: &App, peer: IpAddr, headers: &hyper::HeaderMap) -> Result<(), ApiError> {
+    let client = limit::client(
+        peer,
+        headers.get_all("x-forwarded-for").iter(),
+        &app.config.trusted_proxies,
+    );
+    app.read_limit.check(limit::bucket(client)).map_err(|wait| {
+        app.counters.add(Counter::RateLimitedReads, 1);
+        ApiError::RateLimited(wait)
+    })
 }
 
 /// The token of an "Authorization: Bearer <token>" header.
@@ -204,9 +221,10 @@ where
     B: HttpBody<Data = Bytes> + Unpin,
     B::Error: Display,
 {
-    let member = bearer(&req)
-        .and_then(|token| app.config.member(token))
-        .cloned()
+    let token = bearer(&req).ok_or(ApiError::NotAMember)?.to_owned();
+    let member = blocking(&app, move |app| app.member(&token))
+        .await
+        .map_err(internal("could not check the token"))?
         .ok_or(ApiError::NotAMember)?;
     app.upload_limit.check(member.id.clone()).map_err(|wait| {
         app.counters.add(Counter::RateLimitedUploads, 1);
@@ -542,6 +560,193 @@ async fn admin_delete(
         .status(StatusCode::NO_CONTENT)
         .body(empty())
         .expect("valid response"))
+}
+
+/// `POST /api/admin/ban/<member id>`. Their files stay until they expire.
+async fn admin_ban(
+    app: Arc<App>,
+    id: &str,
+    token: Option<String>,
+) -> Result<Response<Body>, ApiError> {
+    let admin = token
+        .as_deref()
+        .and_then(|token| app.config.admin(token))
+        .cloned()
+        .ok_or(ApiError::NotAnAdmin)?;
+    let id = MemberId::parse(id).ok_or(ApiError::NotFound)?;
+    let banned = blocking(&app, {
+        let id = id.clone();
+        move |app| app.db().ban_google_member(&id)
+    })
+    .await
+    .map_err(internal("could not ban"))?;
+    if !banned {
+        return Err(ApiError::NotFound);
+    }
+    log::warn!(
+        "ADMIN BAN: admin {} ({}) banned member {id}",
+        admin.id,
+        admin.name
+    );
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(empty())
+        .expect("valid response"))
+}
+
+fn signin_start(app: &App) -> Response<Body> {
+    let Some(google) = &app.config.google else {
+        return signin_page(
+            StatusCode::NOT_FOUND,
+            "Sign-in with Google is not turned on for this server.",
+            None,
+        );
+    };
+    let Some((state, nonce)) = app.signin.begin((app.now)()) else {
+        return signin_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many people are signing in right now. Try again in a few minutes.",
+            None,
+        );
+    };
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(
+            header::LOCATION,
+            app.signin.redirect_url(google, &state, &nonce),
+        )
+        .body(empty())
+        .expect("valid response")
+}
+
+/// `GET /auth/google/callback`: ends in a page showing a new token once.
+async fn signin_finish(app: Arc<App>, query: Option<&str>) -> Response<Body> {
+    use StatusCode as S;
+    let Some(google) = &app.config.google else {
+        return signin_page(
+            S::NOT_FOUND,
+            "Sign-in with Google is not turned on for this server.",
+            None,
+        );
+    };
+    let now = (app.now)();
+    // Spent first, whatever else is wrong.
+    let Some(nonce) = query_value(query, "state").and_then(|state| app.signin.take(&state, now))
+    else {
+        return signin_page(
+            S::BAD_REQUEST,
+            "This sign-in has expired or was already used. Start again from the upload page.",
+            None,
+        );
+    };
+    let Some(code) = query_value(query, "code") else {
+        return signin_page(
+            S::BAD_REQUEST,
+            "Google did not sign you in, so no token was made. Start again from the upload page if you want one.",
+            None,
+        );
+    };
+    let sub = match app.signin.subject(google, &code, &nonce, now).await {
+        Ok(sub) => sub,
+        Err(SigninError::Unreachable(why)) => {
+            log::error!("google sign-in: {why}");
+            return signin_page(
+                S::BAD_GATEWAY,
+                "Could not finish signing in with Google. Try again later.",
+                None,
+            );
+        }
+        Err(SigninError::Rejected(why)) => {
+            log::warn!("google sign-in refused: {why:?}");
+            return signin_page(
+                S::BAD_REQUEST,
+                "Google's answer could not be verified, so no token was made.",
+                None,
+            );
+        }
+    };
+
+    // All we keep of Google's answer.
+    let sub_sha256: [u8; 32] = Sha256::digest(sub.as_bytes()).into();
+    let token = mint_token();
+    let token_sha256 = token_sha256(&token);
+    let (new_id, max_members) = (MemberId::mint(), google.max_members);
+    let registered = blocking(&app, move |app| {
+        app.db()
+            .register_google(&sub_sha256, &new_id, &token_sha256, max_members)
+    })
+    .await;
+    match registered {
+        Ok(Registration::New(id)) => {
+            log::info!("google sign-in: new member {id}");
+            signin_page(S::OK, "You are signed in. Your upload token:", Some(&token))
+        }
+        Ok(Registration::Returning(id)) => {
+            log::info!("google sign-in: member {id} came back and got a new token");
+            signin_page(
+                S::OK,
+                "Welcome back. Your upload token, which replaces your old one:",
+                Some(&token),
+            )
+        }
+        Ok(Registration::Banned) => {
+            log::warn!("google sign-in: a banned member tried to sign in");
+            signin_page(
+                S::FORBIDDEN,
+                "This account has been blocked from this server.",
+                None,
+            )
+        }
+        Ok(Registration::Full) => {
+            log::warn!("google sign-in: refused, max_members ({max_members}) reached");
+            signin_page(
+                S::FORBIDDEN,
+                "This server has reached the number of members it allows, so no new member can sign in. Ask its admin.",
+                None,
+            )
+        }
+        Err(e) => {
+            log::error!("google sign-in: could not register: {e}");
+            signin_page(
+                S::INTERNAL_SERVER_ERROR,
+                "Something went wrong on the server. No token was made.",
+                None,
+            )
+        }
+    }
+}
+
+/// Nothing here comes from the request, so nothing needs escaping.
+fn signin_page(status: StatusCode, message: &str, token: Option<&str>) -> Response<Body> {
+    let token_box = token.map_or(String::new(), |token| {
+        format!(
+            r#"<div class="token-box"><code id="owner-token">{token}</code>
+<p>Copy it now. It is shown once and the server keeps only a fingerprint of it.
+Paste it into the upload page. Signing in again gives a new token and cancels this one.</p></div>"#
+        )
+    });
+    let page = format!(
+        r#"<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Sunbird</title>
+<link rel="stylesheet" href="/app.css">
+<header class="masthead"><h1 class="wordmark">Sunbird</h1></header>
+<main>
+<section class="section"><p>{message}</p>
+{token_box}
+<p><a href="/">Go to the upload page</a></p></section>
+</main>
+"#
+    );
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(page)).map_err(|e| match e {}).boxed())
+        .expect("valid response")
 }
 
 // ---- stats ------------------------------------------------------------------
@@ -2542,6 +2747,11 @@ pub(crate) mod tests {
             get(&s, &format!("/api/download/{}", u.id)).await.status,
             StatusCode::OK
         );
+        // Counted after the body is dropped, on another thread.
+        wait_until("the download is counted", || {
+            s.app.counters.json()["downloads"] == 1
+        })
+        .await;
         let hash = hex(&token_sha256(ADMIN_TOKEN));
         for (why, token) in [
             ("no token", ""),

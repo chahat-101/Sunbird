@@ -1,3 +1,6 @@
 target/
 /data/
 /sunbird.json
+# A config holding real secrets (the Google client secret) never belongs here.
+/deploy/*.json
+!/deploy/sunbird.example.json

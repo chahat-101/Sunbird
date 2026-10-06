@@ -82,6 +82,18 @@ pub struct Member {
     pub quota: Quota,
 }
 
+impl Member {
+    /// Someone who signed in with Google; their token hash is in the database.
+    pub fn self_service(id: MemberId, quota: Quota) -> Member {
+        Member {
+            id,
+            name: "signed in with Google".into(),
+            token_sha256: [0; 32],
+            quota,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Admin {
     pub id: MemberId,
@@ -96,6 +108,17 @@ pub struct Rate {
     pub seconds: u32,
 }
 
+/// Self-service sign-in. Absent from the config means off.
+pub struct GoogleSignin {
+    pub client_id: String,
+    pub client_secret: String,
+    /// This server's `/auth/google/callback`, as registered with Google.
+    pub redirect_uri: String,
+    /// Banned members count.
+    pub max_members: u64,
+    pub quota: Quota,
+}
+
 pub struct Config {
     pub members: Vec<Member>,
     pub admins: Vec<Admin>,
@@ -108,6 +131,7 @@ pub struct Config {
     /// Uploads are refused below this much free space. Quotas limit members; this
     /// limits the disk.
     pub min_free_bytes: u64,
+    pub google: Option<GoogleSignin>,
 }
 
 /// Finds the entry whose token matches, comparing every entry in constant time
@@ -164,6 +188,7 @@ impl Config {
                 "upload_rate",
                 "read_rate",
                 "min_free_bytes",
+                "google_signin",
             ],
         )?;
         if let Some(note) = top.get("note") {
@@ -253,6 +278,7 @@ impl Config {
             upload_rate: rate(top, "upload_rate")?,
             read_rate: rate(top, "read_rate")?,
             min_free_bytes: whole(top, "min_free_bytes", "the config")?,
+            google: top.get("google_signin").map(google_signin).transpose()?,
         })
     }
 }
@@ -428,6 +454,54 @@ fn hash(o: &Map<String, Value>, what: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+fn google_signin(v: &Value) -> Result<GoogleSignin, String> {
+    let what = "google_signin";
+    let o = object(v, what)?;
+    known(
+        o,
+        what,
+        &[
+            "client_id",
+            "client_secret",
+            "redirect_uri",
+            "max_members",
+            "max_active_bytes",
+            "max_active_files",
+            "max_bytes_per_week",
+        ],
+    )?;
+    let text = |key: &str| {
+        o.get(key)
+            .ok_or(format!("{what}: {key} is required"))?
+            .as_str()
+            .filter(|s| !s.trim().is_empty() && s.trim() == *s)
+            .map(str::to_owned)
+            .ok_or(format!("{what}: {key} must be a non-empty string"))
+    };
+    let redirect_uri = text("redirect_uri")?;
+    let local = ["http://localhost", "http://127.0.0.1"]
+        .iter()
+        .any(|p| redirect_uri.starts_with(p));
+    if !(redirect_uri.starts_with("https://") || local)
+        || !redirect_uri.ends_with("/auth/google/callback")
+    {
+        return Err(format!(
+            "{what}: redirect_uri must be https (http only for localhost) and end in /auth/google/callback"
+        ));
+    }
+    Ok(GoogleSignin {
+        client_id: text("client_id")?,
+        client_secret: text("client_secret")?,
+        redirect_uri,
+        max_members: whole(o, "max_members", what)?,
+        quota: Quota {
+            max_active_bytes: whole(o, "max_active_bytes", what)?,
+            max_active_files: whole(o, "max_active_files", what)?,
+            max_bytes_per_week: whole(o, "max_bytes_per_week", what)?,
+        },
+    })
+}
+
 fn rate(top: &Map<String, Value>, key: &str) -> Result<Rate, String> {
     let o = object(
         top.get(key)
@@ -559,6 +633,66 @@ pub(crate) mod tests {
             parse(&c).err().unwrap().contains("same token_sha256"),
             "an admin token that is also a member's"
         );
+    }
+
+    fn google_json() -> serde_json::Value {
+        serde_json::json!({
+            "client_id": "id.apps.googleusercontent.com", "client_secret": "secret",
+            "redirect_uri": "https://files.example.org/auth/google/callback",
+            "max_members": 50, "max_active_bytes": 1, "max_active_files": 2, "max_bytes_per_week": 3,
+        })
+    }
+
+    #[test]
+    fn google_signin_section() {
+        assert!(parse(&config_json(vec![])).unwrap().google.is_none());
+        let mut c = config_json(vec![]);
+        c["google_signin"] = google_json();
+        let g = parse(&c).unwrap().google.unwrap();
+        assert_eq!(
+            (
+                g.max_members,
+                g.quota.max_active_files,
+                g.quota.max_bytes_per_week
+            ),
+            (50, 2, 3)
+        );
+
+        for key in google_json().as_object().unwrap().keys() {
+            let mut c = config_json(vec![]);
+            c["google_signin"] = google_json();
+            c["google_signin"].as_object_mut().unwrap().remove(key);
+            let err = parse(&c).err().unwrap();
+            assert!(
+                err.contains(key) && err.contains("required"),
+                "{key}: {err}"
+            );
+        }
+        let mut c = config_json(vec![]);
+        c["google_signin"] = google_json();
+        c["google_signin"]["max_member"] = 1.into();
+        assert!(parse(&c).err().unwrap().contains("unknown key"));
+        for bad in [
+            "http://files.example.org/auth/google/callback",
+            "https://files.example.org/",
+            "https://files.example.org/auth/google/callback/",
+            "files.example.org/auth/google/callback",
+        ] {
+            let mut c = config_json(vec![]);
+            c["google_signin"] = google_json();
+            c["google_signin"]["redirect_uri"] = bad.into();
+            assert!(parse(&c).err().unwrap().contains("redirect_uri"), "{bad}");
+        }
+        let mut c = config_json(vec![]);
+        c["google_signin"] = google_json();
+        c["google_signin"]["redirect_uri"] = "http://localhost:8080/auth/google/callback".into();
+        assert!(parse(&c).is_ok(), "localhost over http is allowed");
+        for blank in ["", " "] {
+            let mut c = config_json(vec![]);
+            c["google_signin"] = google_json();
+            c["google_signin"]["client_secret"] = blank.into();
+            assert!(parse(&c).is_err(), "secret {blank:?}");
+        }
     }
 
     #[test]

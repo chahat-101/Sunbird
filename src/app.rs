@@ -17,6 +17,7 @@ use subtle::ConstantTimeEq;
 use crate::config::{Admin, Config, Member, MemberId};
 use crate::counters::{Counter, Counters};
 use crate::db::{Db, Error, Usage};
+use crate::google::Signin;
 use crate::limit::Limiter;
 
 /// max_blob (§6.4): 8,192 + 1601 × 65,536. The one format limit the server knows.
@@ -186,6 +187,7 @@ pub struct App {
     /// Previews and downloads, per client address (an IPv6 /64).
     pub read_limit: Limiter<IpAddr>,
     pub counters: Counters,
+    pub signin: Signin,
     /// Free bytes for a non-root process on `dir`'s filesystem. Tests replace it.
     pub free_space: fn(&Path) -> std::io::Result<u64>,
 }
@@ -246,6 +248,7 @@ impl App {
             upload_limit: Limiter::new(config.upload_rate),
             read_limit: Limiter::new(config.read_rate),
             counters,
+            signin: Signin::new(),
             free_space: statvfs_free,
             config,
         };
@@ -256,6 +259,22 @@ impl App {
     pub fn db(&self) -> MutexGuard<'_, Db> {
         // rusqlite rolls back on drop, so a panic leaves the connection usable.
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The member a token belongs to, from the config or from Google sign-in.
+    /// Both come back as the same `Member`; only this function knows the difference.
+    pub fn member(&self, token: &str) -> Result<Option<Member>, Error> {
+        if let Some(member) = self.config.member(token) {
+            return Ok(Some(member.clone()));
+        }
+        let Some(google) = &self.config.google else {
+            return Ok(None);
+        };
+        let hash = crate::config::token_sha256(token);
+        Ok(self
+            .db()
+            .google_member(&hash)?
+            .map(|id| Member::self_service(id, google.quota.clone())))
     }
 
     pub fn blob_path(&self, id: &FileId) -> PathBuf {
@@ -389,6 +408,9 @@ impl App {
             None => "nobody: it was uploaded before uploads were authenticated".to_owned(),
             Some(uid) => match self.config.member_by_id(&uid) {
                 Some(m) => format!("member {uid} ({})", m.name),
+                None if self.db().is_google_member(&uid)? => {
+                    format!("member {uid} (signed in with Google)")
+                }
                 None => format!("member {uid} (no longer in the config)"),
             },
         };

@@ -1,5 +1,5 @@
 {
-  "note": "An example for the layout in deploy/: Caddy on the same machine, in front of the server on 127.0.0.1:8080. Every number is an illustration of the shape, not a recommendation: README.md, Deployment, says how to pick them for your disk, members and link. The server has no defaults, so every limit shown is required. Ids come from `sunbird mint-id`, token_sha256 from `sunbird mint-token`; the tokens behind these hashes were thrown away. 127.0.0.1 is in trusted_proxies because Caddy connects from it and sets X-Forwarded-For; list a proxy only if it sits in front of the server and does that. With none listed the header is ignored.",
+  "note": "An example for the layout in deploy/: Caddy on the same machine, in front of the server on 127.0.0.1:8080. Every number is an illustration of the shape, not a recommendation: README.md, Deployment, says how to pick them for your disk, members and link. The server has no defaults, so every limit shown is required. Ids come from `sunbird mint-id`, token_sha256 from `sunbird mint-token`; the tokens behind these hashes were thrown away. google_signin is optional: delete the whole section and nobody can sign in with Google; its client id and secret come from your own Google Cloud project, and a config holding the real secret must stay out of version control. 127.0.0.1 is in trusted_proxies because Caddy connects from it and sets X-Forwarded-For; list a proxy only if it sits in front of the server and does that. With none listed the header is ignored.",
   "members": [
     {
       "id": "8vz8r7kvqyPiE3qUD-vsNg",
@@ -36,5 +36,14 @@
     "requests": 120,
     "seconds": 60
   },
-  "min_free_bytes": 2147483648
+  "min_free_bytes": 2147483648,
+  "google_signin": {
+    "client_id": "REPLACE-ME.apps.googleusercontent.com",
+    "client_secret": "REPLACE-ME",
+    "redirect_uri": "https://files.example.org/auth/google/callback",
+    "max_members": 50,
+    "max_active_bytes": 268435456,
+    "max_active_files": 5,
+    "max_bytes_per_week": 536870912
+  }
 }

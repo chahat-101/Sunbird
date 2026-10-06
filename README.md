@@ -1,8 +1,8 @@
 # Sunbird
 
-A small file-sharing server for a group that knows each other, such as a
-club. You pick a file, Sunbird encrypts it in your browser, and you get a
-link to send to whoever needs it.
+A small file-sharing server that you host yourself. You pick a file,
+Sunbird encrypts it in your browser, and you get a link to send to whoever
+needs it.
 
 The key to the file lives in the part of the link after `#`. Browsers never
 send that part to the server, so the server only ever holds scrambled bytes.
@@ -10,8 +10,11 @@ Files disappear on their own: after 24 hours by default (7 days at most), or
 once they have been downloaded as many times as you allowed.
 
 Only members with an upload token can upload. Anyone with the link can
-download. If you want an extra lock, add a passphrase, and send it by a
-different route from the link.
+download. Tokens come from an admin, or from signing in with Google if the
+operator allows it (see below).
+
+If you want an extra lock, add a passphrase, and send it by a different route
+from the link.
 
 ## What it looks like
 
@@ -45,6 +48,20 @@ File names are shown as plain text, never as HTML.
 Start your config from `deploy/sunbird.example.json`. Every limit in it is
 required. The binary carries its own web page, so it needs no `web/` folder.
 
+## Getting an upload token
+
+Uploads need `Authorization: Bearer <token>`, however the token was made.
+
+- **From an admin:** `sunbird mint-token`. No third party involved.
+- **By signing in with Google**, if the operator turned it on. This tells
+  Google you used this instance. Sunbird keeps a one-way hash of an opaque
+  Google identifier and nothing else, not your email. Signing in again gives a
+  new token for the same member: your quota and files carry over and the old
+  token stops working, which is also how you recover a lost one.
+
+A Google account is easy to make, so the operator limits sign-ups with
+`max_members`, lower quotas and bans.
+
 To run the tests:
 
     cargo test
@@ -57,9 +74,17 @@ To run the tests:
   change that code. Only a native client would close that gap.
 - The server still sees each file's size, and when it is uploaded and
   downloaded.
+- With Google sign-in on, Google knows you used this instance.
 - Anyone with the link (and the passphrase, if there is one) can open the
   file.
-- "Deleted" means removed from disk and checked gone, not securely erased.
+- **What "deleted" means.** Sunbird unlinks the blob, then checks the path
+  to confirm it is gone. If it is still there, the row stays marked, the
+  failure is logged loudly, and every sweep retries. It does not overwrite
+  blocks, which is not reliably possible from userspace on an SSD, and it
+  does not cover filesystem snapshots or backups. That matters less than it
+  sounds: the server never holds a decryption key, so a blob that survives a
+  failed delete is ciphertext the operator cannot read. Verified deletion is
+  the second layer, for when a link leaks from somewhere else.
 
 ## Licence
 

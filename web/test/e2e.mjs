@@ -35,6 +35,8 @@ const KAT_PW_KEY = 'c5149c70ce74d0f923b88f8e36ece0c580fe7a12b3575728dbf804174fdd
 // Tokens as `sunbird mint-token` makes them; only their hashes go in the config.
 const TOKEN = randomBytes(16).toString('base64url');
 const SMALL_TOKEN = randomBytes(16).toString('base64url'); // a member with a 2000-byte quota
+const GOOGLE_CLIENT_ID = 'e2e-client.apps.googleusercontent.com';
+const GOOGLE_CLIENT_SECRET = randomBytes(12).toString('hex');
 const BAD_TOKEN = 'The server did not accept this upload token. Check it, or ask the admin whether it is still valid.';
 
 // ---- helpers --------------------------------------------------------------
@@ -673,6 +675,45 @@ test('upload token: the page says the server is shared and the token identifies 
   eq(direct.status, 401, 'upload with no Authorization header');
 });
 
+test('google sign-in: offered on the page; redirects with state and nonce, no cookie; stale callback and sign-in off say so', async () => {
+  await go(`${base}/`);
+  const link = await inPage(() => {
+    const a = document.getElementById('google-signin');
+    return { href: a.getAttribute('href'), note: document.getElementById('signin-note').textContent.replace(/\s+/g, ' ') };
+  });
+  eq(link.href, '/auth/google', 'link');
+  ok(/tells Google you used this server/.test(link.note), `note: ${link.note}`);
+  ok(/not your email/.test(link.note) && /no third party/.test(link.note), `note: ${link.note}`);
+
+  const start = await fetch(`${base}/auth/google`, { redirect: 'manual' });
+  eq(start.status, 302, 'redirect status');
+  eq(start.headers.get('set-cookie'), null, 'cookie on the redirect');
+  const to = new URL(start.headers.get('location'));
+  eq(`${to.origin}${to.pathname}`, 'https://accounts.google.com/o/oauth2/v2/auth', 'redirect target');
+  eq(to.searchParams.get('response_type'), 'code', 'response_type');
+  eq(to.searchParams.get('scope'), 'openid', 'scope');
+  eq(to.searchParams.get('client_id'), GOOGLE_CLIENT_ID, 'client_id');
+  eq(to.searchParams.get('redirect_uri'), 'https://files.example.org/auth/google/callback', 'redirect_uri');
+  ok((to.searchParams.get('state') ?? '').length >= 22 && (to.searchParams.get('nonce') ?? '').length >= 22, 'state and nonce');
+  ok(!start.headers.get('location').includes(GOOGLE_CLIENT_SECRET), 'the secret went to the browser');
+
+  // A callback nobody started: a readable page in the real browser, no token.
+  await go(`${base}/auth/google/callback?code=x&state=never-issued`);
+  const page = await inPage(() => ({ text: document.body.textContent.replace(/\s+/g, ' '), token: !!document.getElementById('owner-token') }));
+  ok(/expired or was already used/.test(page.text), `stale callback: ${page.text}`);
+  ok(!page.token, 'a token on a failed sign-in');
+
+  // The same server software with the section left out: sign-in is off.
+  const off = await startServer('data-nosignin', {
+    upload_rate: { requests: 10000, seconds: 60 },
+    read_rate: { requests: 100000, seconds: 60 },
+    members: [member('e2e', TOKEN)],
+  });
+  const gone = await fetch(`${off}/auth/google`, { redirect: 'manual' });
+  eq(gone.status, 404, 'sign-in off: status');
+  ok(/not turned on/.test(await gone.text()), 'sign-in off: message');
+});
+
 test('upload token: remembered in the browser only when asked, and only once accepted', async () => {
   await go(`${base}/`);
   const stored = () => inPage(() => localStorage.getItem('sunbird.uploadToken'));
@@ -1074,6 +1115,11 @@ try {
     upload_rate: { requests: 10000, seconds: 60 },
     read_rate: { requests: 100000, seconds: 60 },
     members: [member('e2e', TOKEN), member('small', SMALL_TOKEN, { max_active_bytes: 2000, max_active_files: 10 })],
+    google_signin: {
+      client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: 'https://files.example.org/auth/google/callback',
+      max_members: 5, max_active_bytes: lots, max_active_files: lots, max_bytes_per_week: lots,
+    },
   });
   b = await launch(browser);
   if (phone) await b.viewport(...PHONE);

@@ -11,7 +11,7 @@ why, so a later change is a deliberate reversal rather than drift.
 ## D1. Threat model
 
 **Defending against:** someone with root on the server who is not an intended
-recipient. Concretely, a future club tech lead who inherits the box, or anyone
+recipient. Concretely, a future administrator who inherits the box, or anyone
 who takes a disk image or database dump.
 
 **Not defending against:** an operator who serves modified frontend JavaScript.
@@ -120,7 +120,9 @@ Service Worker then.
 - **Deletion:** verify it. Check the blob is gone after unlinking and log
   failures loudly. Send's filesystem backend never deletes time-expired blobs
   in either fork, behind a dead config flag (`server/config.js:115-119`) — the
-  single most repeated failure in the study (§3.1).
+  single most repeated failure in the study (§3.1). Scope: "verified" means
+  confirmed gone from the filesystem — not overwritten; snapshots and backups
+  are out of scope.
 - **Tamper-evidence, narrowly:** bind the limits into AEAD additional data
   (PrivateBin). This proves the limits *the uploader set*; it does not prove
   the server honoured them. A client can check expiry against its own clock,
@@ -146,8 +148,8 @@ advisories come from displaying a decrypted filename or MIME type (§3.9).
 ## D8. Client
 
 Web only for v1. Not because it is better — it makes R2 a policy rather than a
-property (§5.2) — but because a club will not adopt a CLI, and adoption is the
-point.
+property (§5.2) — but because most people will not adopt a CLI, and adoption
+is the point.
 
 A Go CLI is on the roadmap as the honest mitigation for D1's excluded case. The
 server is already Go, and ffsend shows constant-memory streaming is
@@ -171,14 +173,53 @@ decided then.
 
 - **Bytes through the app.** One VPS, no object storage. Pins R6 to session
   affinity; R6 is explicitly later.
-- **Upload is authenticated.** Club members only, with per-user quotas and
-  rate limits. Firefox Send shipped anonymous and unquota'd and died of it.
+- **Upload is authenticated.** Known members only, from an explicit member
+  list, with per-user quotas and rate limits. Firefox Send shipped anonymous and unquota'd and died of it.
 - **Store `uploader_id`.** Cannot see the file; can revoke and can answer a
   takedown.
 - **Trust the proxy correctly.** Do not read `X-Forwarded-For[0]` blindly
   (epherra, PrivateBin both get this wrong). Walk it over configured trusted
   proxies; throttle IPv6 by /64 (Nextcloud `Request.php:541-580`).
 - **Defaults:** 24 hour expiry, 7 day maximum, download limit 1.
+
+**Amended in R5: a deliberate reversal of part of the second bullet.** Tokens
+used to be admin-minted only. An operator may now also let people register
+themselves by signing in with Google. Uploads are still authenticated, with
+quotas and rate limits, and still recorded under a member id.
+
+*Why.* Adding every person by hand does not scale with adoption (D8). Google
+sign-in proves "a person with a Google account" with no mail server, passwords
+or account database of our own.
+
+*The rule.* Signing in gets you a token; it is not a way to upload. Uploads
+still need `Authorization: Bearer <token>` and nothing else, so there is one
+upload path (D4). `App::member(token)` returns the same `Member` whether the
+token came from the config or from a sign-in, and a test fails if the upload
+handler ever mentions sign-in. Admin-minted tokens work unchanged.
+
+*What we keep.* One table, `google_members`: a SHA-256 of Google's `sub`, the
+member id, the hash of the current token, and a `banned` flag. No email, name,
+picture or Google token. Signing in again mints a new token for the same member
+id, so quota and files carry over, and it doubles as token recovery.
+
+*No sessions.* No cookie, no session table. The redirect carries a random
+`state` and `nonce`, held in memory for 10 minutes and spent on first use. The
+ID token is checked server-side: RS256 only, signature against Google's cached
+keys, then `iss`, `aud`, `exp`, `iat` and `nonce`.
+
+*Bounds.* A Google account is free, so this proves little about who someone is.
+`max_members` caps how many people exist, self-service members get lower default
+quotas, and an admin can ban a member. A ban keeps the `sub` hash and holds its
+place under the cap. Sign-in requests share the per-address `read_rate`.
+
+*Accepted.* Google learns the person used this instance. With no cookie the flow
+is not tied to a browser, so someone can be handed another person's callback;
+that gives the other person nothing.
+
+*Dependencies.* BUILD.md allowed no crypto crate beyond `sha2` and `subtle`.
+Checking Google's RSA signatures and reaching Google over TLS needs `ring`,
+`rustls`, `tokio-rustls` and `webpki-roots`. The server still never touches
+file contents or file keys.
 
 ---
 
@@ -204,3 +245,5 @@ From §3.11, the projects that overstate. Do not join them.
 - Not "zero-knowledge" — the server ships the JavaScript (D1).
 - Not "files are deleted" unless deletion is verified (D6).
 - Not "protocol unchanged" across any KDF or format change. Version the format.
+- Not "anonymous" or "no third party" for Google sign-in: Google learns the
+  person used this instance. Admin-minted tokens involve no third party.

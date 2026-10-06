@@ -27,7 +27,7 @@ enum Migration {
 ///
 /// There is no 4.sql on purpose: migration 4 only fills data, so it's Rust
 /// (`member_ids`, below).
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     // 1: the blobs table (steps 03 to 05 of the original server).
     Migration::Sql(include_str!("migrations/1.sql")),
     // 2: expiry (step 06). Guesses D9's defaults for older rows.
@@ -38,6 +38,8 @@ const MIGRATIONS: [Migration; 5] = [
     Migration::Fill(member_ids),
     // 5: counters (step 10).
     Migration::Sql(include_str!("migrations/5.sql")),
+    // 6: members who signed in with Google.
+    Migration::Sql(include_str!("migrations/6.sql")),
 ];
 
 /// What "this file exists" means, for every endpoint. Deleted, expired or used
@@ -45,6 +47,14 @@ const MIGRATIONS: [Migration; 5] = [
 /// max_downloads 0 means no limit. Binds :now.
 const SERVABLE: &str =
     "deleting = 0 AND expires_at > :now AND (max_downloads = 0 OR downloads < max_downloads)";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Registration {
+    New(MemberId),
+    Returning(MemberId),
+    Banned,
+    Full,
+}
 
 pub struct Db(Connection);
 
@@ -58,6 +68,9 @@ impl Db {
         if mode != "wal" {
             return Err(format!("{}: journal_mode is {mode}, not wal", path.display()).into());
         }
+        // SQLite does not zero freed pages, so a deleted row would otherwise
+        // survive inside the file. Per connection, so it is set on every open.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let mut db = Db(conn);
         db.migrate()?;
@@ -322,6 +335,81 @@ impl Db {
             .map(drop)
     }
 
+    /// The unbanned member holding this token. Lookup is by hash, so its timing reveals nothing.
+    pub fn google_member(&self, token_sha256: &[u8; 32]) -> Result<Option<MemberId>, Error> {
+        let id: Option<String> = self
+            .0
+            .query_row(
+                "SELECT member_id FROM google_members WHERE token_sha256 = ? AND banned = 0",
+                [&token_sha256[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id.and_then(|id| MemberId::parse(&id)))
+    }
+
+    pub fn is_google_member(&self, id: &str) -> rusqlite::Result<bool> {
+        self.0
+            .query_row(
+                "SELECT 1 FROM google_members WHERE member_id = ?",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+    }
+
+    /// A known `sub` hash keeps its member id and swaps in the new token; an
+    /// unknown one becomes `new_id` unless `max_members` is reached. One
+    /// transaction, so parallel sign-ins cannot pass the cap together.
+    pub fn register_google(
+        &mut self,
+        sub_sha256: &[u8; 32],
+        new_id: &MemberId,
+        token_sha256: &[u8; 32],
+        max_members: u64,
+    ) -> Result<Registration, Error> {
+        self.write(|tx| {
+            let known: Option<(String, bool)> = tx
+                .query_row(
+                    "SELECT member_id, banned FROM google_members WHERE sub_sha256 = ?",
+                    [&sub_sha256[..]],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, banned)) = known {
+                if banned {
+                    return Ok(Registration::Banned);
+                }
+                tx.execute(
+                    "UPDATE google_members SET token_sha256 = ? WHERE sub_sha256 = ?",
+                    params![&token_sha256[..], &sub_sha256[..]],
+                )?;
+                let id = MemberId::parse(&id).ok_or("a stored member id is malformed")?;
+                return Ok(Registration::Returning(id));
+            }
+            // Banned rows count, so a ban frees no place.
+            let members: i64 =
+                tx.query_row("SELECT COUNT(*) FROM google_members", [], |r| r.get(0))?;
+            if members as u64 >= max_members {
+                return Ok(Registration::Full);
+            }
+            tx.execute(
+                "INSERT INTO google_members (sub_sha256, member_id, token_sha256) VALUES (?, ?, ?)",
+                params![&sub_sha256[..], new_id.as_str(), &token_sha256[..]],
+            )?;
+            Ok(Registration::New(new_id.clone()))
+        })
+    }
+
+    /// The row stays, so signing in again finds the ban. False if no such member.
+    pub fn ban_google_member(&self, id: &MemberId) -> rusqlite::Result<bool> {
+        Ok(self.0.execute(
+            "UPDATE google_members SET banned = 1 WHERE member_id = ?",
+            [id.as_str()],
+        )? == 1)
+    }
+
     /// Whether any row has this `id`, and who uploaded it (None for files from
     /// before uploads needed a token).
     pub fn uploader(&self, id: &FileId) -> rusqlite::Result<Option<Option<String>>> {
@@ -496,7 +584,7 @@ mod tests {
             app: Arc::new(open(&dir.0).expect("a step 05 data directory did not open")),
             dir,
         };
-        assert_eq!(user_version(s.app.db().conn()), 5);
+        assert_eq!(user_version(s.app.db().conn()), 6);
         for (id, at) in &created {
             let row: (i64, i64, i64, i64, Option<String>) = s
                 .app
@@ -552,7 +640,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (user_version(db.conn()), rows),
-            (5, 0),
+            (6, 0),
             "second open: version, rows"
         );
     }
@@ -574,7 +662,7 @@ mod tests {
             app: Arc::new(open(&dir.0).expect("a step 06 data directory did not open")),
             dir,
         };
-        assert_eq!(user_version(s.app.db().conn()), 5);
+        assert_eq!(user_version(s.app.db().conn()), 6);
         let kept: (i64, i64, i64) = s
             .app
             .db()
@@ -646,7 +734,7 @@ mod tests {
         );
         let dir = step07(&[&file]);
         let app = open(&dir.0).expect("a step 07 database with no member names did not open");
-        assert_eq!(user_version(app.db().conn()), 5);
+        assert_eq!(user_version(app.db().conn()), 6);
     }
 
     #[tokio::test]
@@ -656,7 +744,7 @@ mod tests {
         s.app
             .db()
             .conn()
-            .execute_batch("PRAGMA user_version = 6")
+            .execute_batch("PRAGMA user_version = 7")
             .unwrap();
         let Server { app, dir } = s;
         drop(app);
@@ -677,7 +765,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (n, user_version(&db)),
-            (1, 6),
+            (1, 7),
             "the refused database was changed"
         );
     }
@@ -925,10 +1013,16 @@ mod tests {
         };
         {
             let db = s.app.db();
-            assert_eq!(user_version(db.conn()), 5);
+            assert_eq!(user_version(db.conn()), 6);
             assert!(
-                schema(db.conn()) == schema_before,
-                "opening changed the schema"
+                without_v6(schema(db.conn())) == schema_before,
+                "opening changed the schema beyond migration 6"
+            );
+            assert!(
+                schema(db.conn())
+                    .iter()
+                    .any(|(_, name, _)| name == "google_members"),
+                "migration 6 did not run"
             );
             assert!(dump(db.conn()) == rows_before, "opening changed a row");
         }
@@ -1064,6 +1158,16 @@ mod tests {
         }
     }
 
+    /// `schema` without what migration 6 added.
+    fn without_v6(
+        schema: Vec<(String, String, Option<String>)>,
+    ) -> Vec<(String, String, Option<String>)> {
+        schema
+            .into_iter()
+            .filter(|(_, name, _)| !name.contains("google_members"))
+            .collect()
+    }
+
     fn schema(db: &rusqlite::Connection) -> Vec<(String, String, Option<String>)> {
         db.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
             .unwrap()
@@ -1125,12 +1229,18 @@ mod tests {
             let db = s.app.db();
             assert_eq!(
                 (user_version(db.conn()), version_before),
-                (5, 5),
+                (6, 5),
                 "user_version"
             );
             assert!(
-                schema(db.conn()) == schema_before,
-                "opening changed the schema"
+                without_v6(schema(db.conn())) == schema_before,
+                "opening changed the schema beyond migration 6"
+            );
+            assert!(
+                schema(db.conn())
+                    .iter()
+                    .any(|(_, name, _)| name == "google_members"),
+                "migration 6 did not run"
             );
             assert!(
                 table(db.conn(), "SELECT * FROM blobs ORDER BY id") == blobs_before,
@@ -1155,8 +1265,8 @@ mod tests {
         );
         let fresh = TempDir::new();
         assert!(
-            schema(open(&fresh.0).unwrap().db().conn()) == schema_before,
-            "the migrations no longer produce schema v5"
+            without_v6(schema(open(&fresh.0).unwrap().db().conn())) == schema_before,
+            "the first five migrations no longer produce schema v5"
         );
 
         let files = manifest["files"].as_array().unwrap();
@@ -1202,7 +1312,12 @@ mod tests {
             StatusCode::NO_CONTENT,
             "delete with an owner token issued before the rewrite"
         );
-        let u = upload(&s, &random_blob(10)).await;
+        // The clock is pinned, so the limits must be too.
+        let path = format!(
+            "/api/upload?expires_at={}&max_downloads=0",
+            1_790_584_249 + 86400
+        );
+        let u = upload_with(&s, &path, &random_blob(10)).await;
         assert_eq!(
             get(&s, &format!("/api/download/{}", u.id)).await.status,
             StatusCode::OK,
