@@ -221,8 +221,6 @@
     }
   }
 
-  // ---- upload ---------------------------------------------------------------
-
   const STRETCH_DETAIL = 'This page is still working: ';
   let uploading = false;
 
@@ -260,6 +258,14 @@
     showChosen();
   }
 
+  // The button's second line restates the limits it will upload with.
+  function summarise() {
+    const expiry = $('expiry').selectedOptions[0];
+    const limit = $('downloads').selectedOptions[0];
+    $('upload-expiry').textContent = expiry ? expiry.textContent : '';
+    $('upload-limit').textContent = limit ? limit.dataset.summary || limit.textContent : '';
+  }
+
   function showUpload() {
     $('upload').hidden = false;
     const remembered = rememberedToken();
@@ -289,6 +295,9 @@
     protect.addEventListener('change', follow);
     passphrase.addEventListener('input', count);
     follow();
+    $('expiry').addEventListener('change', summarise);
+    $('downloads').addEventListener('change', summarise);
+    summarise();
 
     $('file').addEventListener('change', showChosen);
     showChosen();
@@ -327,6 +336,7 @@
     const status = $('upload-status');
     const button = $('upload-button');
     $('result').hidden = true;
+    summarise();
 
     // Refuse bad input before doing any work.
     const file = $('file').files[0];
@@ -428,8 +438,6 @@
       button.disabled = false;
     }
   }
-
-  // ---- download -------------------------------------------------------------
 
   function formatTime(seconds) {
     // Beyond what Date can show, print the raw number.
@@ -569,6 +577,7 @@
         $('expired-warning').textContent =
           `The sender set this link to expire on ${expiry}. The server provided it anyway.`;
         $('expired-warning').hidden = false;
+        $('expired').hidden = false;
       }
       $('details').hidden = false;
     }

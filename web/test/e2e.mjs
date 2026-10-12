@@ -39,8 +39,6 @@ const GOOGLE_CLIENT_ID = 'e2e-client.apps.googleusercontent.com';
 const GOOGLE_CLIENT_SECRET = randomBytes(12).toString('hex');
 const BAD_TOKEN = 'The server did not accept this upload token. Check it, or ask the admin whether it is still valid.';
 
-// ---- helpers --------------------------------------------------------------
-
 function pattern(n, seed) {
   const u = new Uint8Array(n);
   for (let i = 0; i < n; i++) u[i] = (i * 31 + seed) % 251;
@@ -267,8 +265,6 @@ async function clickDownload() {
   await inPage(() => { document.getElementById('download-button').click(); });
   return waitState('download-status', ['done', 'error']);
 }
-
-// ---- tests ----------------------------------------------------------------
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -781,7 +777,7 @@ test('passphrase worker: the page runs Argon2id off its main thread, gives the k
     };
   });
   eq(page.key, KAT_PW_KEY, 'Argon2id through the page');
-  eq(JSON.stringify(page.scripts), '["/src/argon2.js","/src/crypto.js","/src/app.js"]', 'scripts in the page (hash-wasm must not be one)');
+  eq(JSON.stringify(page.scripts), '["/src/theme.js","/src/dither.js","/src/argon2.js","/src/crypto.js","/src/app.js"]', 'scripts in the page (hash-wasm must not be one)');
   eq(page.libraryApi, 'undefined', 'hash-wasm\'s own API in the page');
   // A ratio, not a time: a main thread doing the work misses every tick for the whole call.
   ok(page.stretch.longestPause < page.stretch.ms / 2,
@@ -1079,8 +1075,6 @@ test('phone (390×844): nothing scrolls sideways and every control is a 44 px ta
     await b.viewport(...(phone ? PHONE : [null]));
   }
 });
-
-// ---- runner ---------------------------------------------------------------
 
 execFileSync('sh', ['-c', 'cargo build --quiet && cp target/debug/sunbird "$0"', join(work, 'sunbird')], { cwd: root, stdio: 'inherit' });
 const tokenHash = (token) => createHash('sha256').update(token).digest('hex');

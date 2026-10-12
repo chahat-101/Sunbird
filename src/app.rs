@@ -174,15 +174,12 @@ fn decimal<T: std::str::FromStr>(s: &str) -> Option<T> {
     if canonical { s.parse().ok() } else { None }
 }
 
-// ---- the data directory -----------------------------------------------------
-
 pub struct App {
     dir: PathBuf,
     db: Mutex<Db>,
     /// The clock limits are judged by, in Unix seconds. Tests replace it.
     pub now: fn() -> i64,
     pub config: Config,
-    /// Uploads, per member id.
     pub upload_limit: Limiter<MemberId>,
     /// Previews and downloads, per client address (an IPv6 /64).
     pub read_limit: Limiter<IpAddr>,
@@ -301,7 +298,6 @@ impl App {
         Ok(free >= self.config.min_free_bytes.saturating_add(more))
     }
 
-    /// Writes the counters to the database.
     pub fn save_counters(&self) -> Result<(), Error> {
         self.db().save_counters(&self.counters.rows())
     }

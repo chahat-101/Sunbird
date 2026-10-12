@@ -4,200 +4,211 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Sunbird</title>
+<link rel="preload" href="/assets/schibsted-grotesk.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/app.css">
+<script src="/src/theme.js"></script>
 
-<header class="masthead">
-  <div>
-    <h1 class="wordmark">Sunbird</h1>
-    <p class="tagline">Send a file, encrypted on your device before it leaves.</p>
-  </div>
-  <span class="hero" role="img" aria-label="Two sunbirds on orange tecoma flowers"></span>
-</header>
+<div class="theme" role="group" aria-label="Colour theme">
+  <button type="button" data-theme-choice="system" aria-pressed="true">System</button>
+  <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+  <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+</div>
 
 <main id="upload" hidden>
-<div class="columns">
-<div class="column">
-  <section class="section decide">
-    <h2>File</h2>
-    <label id="drop-zone" class="drop" data-chosen="no">
-      <input id="file" type="file" class="visually-hidden">
-      <span class="drop-glyph"><svg class="icon icon-upload" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg><svg class="icon icon-file" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></span>
-      <span id="drop-empty"><strong>Choose a file</strong> or drop it here</span>
-      <span id="drop-chosen" hidden><span id="chosen-name"></span> <span id="chosen-size" class="hint"></span></span>
-      <span class="hint">One file, up to 100 MiB.</span>
-    </label>
-  </section>
-
-  <section class="section decide">
-    <h2>Upload token</h2>
-    <label class="field" for="upload-token">Your upload token</label>
-    <input id="upload-token" type="password" autocomplete="off" spellcheck="false">
-    <p id="token-note" class="hint">This is a shared server. Your upload token identifies you to the
-      server's admin: every file you upload is recorded as yours, so the admin can see who uploaded a file
-      and remove it. Anyone with your token uploads as you.</p>
-    <p id="signin-note" class="hint">No token? If this server allows it,
-      <a id="google-signin" href="/auth/google">sign in with Google</a> to get one. That tells Google you used
-      this server. We keep only a one-way hash of an opaque Google ID, not your email. A token from the
-      admin involves no third party.</p>
-    <label class="check"><input id="remember-token" type="checkbox"> Remember the token in this browser</label>
-  </section>
-</div>
-
-<div class="column">
-  <section class="section decide">
-    <h2>Who can open it</h2>
-    <label class="check"><input id="protect" type="checkbox"> Require a passphrase</label>
-    <p id="mode-public" class="mode mode-public"><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3C9.5 5.6 8.2 8.6 8.2 12s1.3 6.4 3.8 9"/></svg><span><strong>Public link</strong>: anyone who has the link can
-      open this file. There is no passphrase or other second factor.</span></p>
-    <p id="mode-restricted" class="mode mode-restricted" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg><span><strong>Passphrase-protected</strong>: the
-      file opens only with the link and the passphrase together. Send the passphrase separately from the link.</span></p>
-    <label class="field" for="passphrase">Passphrase</label>
-    <input id="passphrase" type="password" autocomplete="new-password" disabled>
-    <p id="passphrase-hint" class="hint">Length is what makes a passphrase hard to guess: a few ordinary
-      words beat one short word full of symbols, and are easier to say aloud. It is used exactly as typed,
-      spaces included. <span id="passphrase-length">0 characters</span></p>
-  </section>
-
-  <section class="section decide">
-    <h2>Limits</h2>
-    <div class="pair">
-      <div>
-        <label class="field" for="expiry">Expires after</label>
-        <span class="select">
-        <select id="expiry">
-          <option value="3600">1 hour</option>
-          <option value="86400" selected>24 hours</option>
-          <option value="259200">3 days</option>
-          <option value="604800">7 days</option>
-        </select><svg class="icon chevron" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6.5 9.5 5.5 5.5 5.5-5.5"/></svg></span>
-      </div>
-      <div>
-        <label class="field" for="downloads">Download limit</label>
-        <span class="select">
-        <select id="downloads">
-          <option value="1" selected>1 download</option>
-          <option value="5">5 downloads</option>
-          <option value="10">10 downloads</option>
-          <option value="0">No download limit (expires by time only)</option>
-        </select><svg class="icon chevron" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m6.5 9.5 5.5 5.5 5.5-5.5"/></svg></span>
-      </div>
+  <header class="hero">
+    <div class="dither" data-dither="photo" data-dither-src="/assets/sunbird.jpg" data-dither-bg="0.66"><canvas aria-hidden="true"></canvas></div>
+    <div class="hero-inner">
+      <h1 class="wordmark">Sunbird</h1>
     </div>
-    <p class="hint">These limits are sealed into the file, and cannot be changed after upload. The server
-      stops serving the file and deletes it when the first one is reached.</p>
-  </section>
+  </header>
 
-  <section class="section commit">
-    <button id="upload-button" type="button" class="primary">Encrypt and upload
-      <span class="button-mode">(<span id="upload-mode">public link</span>)</span></button>
-    <p id="upload-status" class="status" role="status"></p>
-    <ol id="upload-steps" class="steps" hidden>
-      <li data-step="stretch" data-state="pending">
-        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
-        <span class="step-name">Stretching the passphrase</span>
-        <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on
-          purpose: every guess at the passphrase costs this much, for anyone who gets the link and the
-          file without it. Usually 1–3 seconds on a phone.</p>
-        <progress max="1" value="0"></progress>
-        <span class="step-detail"></span>
-      </li>
-      <li data-step="encrypt" data-state="pending">
-        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
-        <span class="step-name">Encrypting on this device</span>
-        <progress max="1" value="0"></progress>
-        <span class="step-detail"></span>
-      </li>
-      <li data-step="upload" data-state="pending">
-        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
-        <span class="step-name">Uploading</span>
-        <progress max="1" value="0"></progress>
-        <span class="step-detail"></span>
-      </li>
-    </ol>
-  </section>
+  <div class="frame">
+    <p class="lede">Send one file. It is encrypted in this browser before it is uploaded. The server stores bytes it cannot read, and deletes them after the time or number of downloads you choose.</p>
 
-  <section id="result" class="section result" hidden>
-    <h2>Uploaded</h2>
-    <label class="field" for="link">Link</label>
-    <div class="copy-row">
-      <input id="link" type="text" readonly>
-      <button id="copy-link" type="button">Copy link</button>
-    </div>
-    <p id="copy-link-status" class="status" role="status"></p>
-    <p id="link-public" class="mode mode-public" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3C9.5 5.6 8.2 8.6 8.2 12s1.3 6.4 3.8 9"/></svg><span>This link is the whole key. Anyone who has all of it
-      can open the file, and nothing else is asked for, so share it only with the people who should have the file.</span></p>
-    <p id="link-restricted" class="mode mode-restricted" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg><span>This link alone does not open the file: the
-      passphrase is needed too. Send the passphrase by a different route from the link.</span></p>
-    <p class="hint">The part after the <code>#</code> is the key to the file. It never reaches
-      the server: browsers do not send it.</p>
-    <div class="token-box">
-      <p><strong>Owner token. Save this token now. It is shown once.</strong></p>
-      <div class="copy-row">
-        <code id="owner-token"></code>
-        <button id="copy-token" type="button">Copy token</button>
+    <div class="layout">
+      <div class="sheet">
+        <section class="block">
+          <h2>File</h2>
+          <label id="drop-zone" class="drop" data-chosen="no">
+            <input id="file" type="file" class="visually-hidden">
+            <span id="drop-empty" class="drop-empty"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg><span class="drop-title"><strong>Choose a file</strong> or drop it anywhere on this page</span><span class="drop-sub">One file, up to 100 MiB</span></span>
+            <span id="drop-chosen" class="drop-chosen" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg><span class="chosen-text"><span id="chosen-name"></span><span id="chosen-size" class="mono"></span></span><span class="drop-change">Change</span></span>
+          </label>
+        </section>
+
+        <section class="block">
+          <h2>Who can open it</h2>
+          <label class="check"><input id="protect" type="checkbox"><span>Require a passphrase</span></label>
+          <p id="mode-public" class="note"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 7.7-1.5"/></svg><span><strong>Public link</strong>: anyone who has the link can open this file. There is no passphrase or other second factor.</span></p>
+          <p id="mode-restricted" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>Passphrase-protected</strong>: the file opens only with the link and the passphrase together. Send the passphrase separately from the link.</span></p>
+          <div class="field">
+            <label class="label" for="passphrase">Passphrase</label>
+            <input id="passphrase" type="password" autocomplete="new-password" spellcheck="false" disabled>
+            <p id="passphrase-hint" class="hint">Length is what makes a passphrase hard to guess: a few ordinary words beat one short word full of symbols, and are easier to say aloud. It is used exactly as typed, spaces included. <span id="passphrase-length" class="count mono">0 characters</span></p>
+          </div>
+        </section>
+
+        <section class="block">
+          <h2>Limits</h2>
+          <div class="pair">
+            <div class="field">
+              <label class="label" for="expiry">Expires after</label>
+              <span class="select"><select id="expiry">
+                <option value="3600">1 hour</option>
+                <option value="86400" selected>24 hours</option>
+                <option value="259200">3 days</option>
+                <option value="604800">7 days</option>
+              </select><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 9l6 6 6-6"/></svg></span>
+            </div>
+            <div class="field">
+              <label class="label" for="downloads">Download limit</label>
+              <span class="select"><select id="downloads">
+                <option value="1" selected>1 download</option>
+                <option value="5">5 downloads</option>
+                <option value="10">10 downloads</option>
+                <option value="0" data-summary="no download limit">No download limit (expires by time only)</option>
+              </select><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 9l6 6 6-6"/></svg></span>
+            </div>
+          </div>
+          <p class="hint">Both limits are sealed into the file and cannot be changed after upload. The server stops serving the file and deletes it when the first one is reached.</p>
+        </section>
+
+        <section class="block">
+          <h2>Upload token</h2>
+          <div class="field">
+            <label class="label" for="upload-token">Your upload token</label>
+            <input id="upload-token" class="mono-input" type="password" autocomplete="off" spellcheck="false">
+            <p id="token-note" class="hint">This is a shared server. Your upload token identifies you to the server's admin: every file you upload is recorded as yours, so the admin can see who uploaded a file and remove it. Anyone with your token uploads as you.</p>
+          </div>
+          <label class="check"><input id="remember-token" type="checkbox"><span>Remember the token in this browser</span></label>
+          <div class="signin">
+            <a id="google-signin" class="btn" href="/auth/google">Sign in with Google<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 16L16 8M10 8h6v6"/></svg></a>
+            <p id="signin-note" class="hint">No token? If this server allows it, sign in with Google to get one. You leave this page, and come back to a page showing your new token. That tells Google you used this server. The server keeps only a one-way hash of an opaque Google ID, not your email. A token from the admin involves no third party.</p>
+          </div>
+        </section>
       </div>
-      <p id="copy-token-status" class="status" role="status"></p>
-      <p>It is the only way to delete the file before it expires, and it cannot be recovered: the
-        server keeps only a fingerprint of it.</p>
+
+      <aside class="send">
+        <dl class="exposure">
+          <div><dt>The server receives</dt><dd>The encrypted file and its size, the expiry and download limit, your upload token, and your network address.</dd></div>
+          <div><dt>It never receives</dt><dd>The file’s name, type or contents, the passphrase, or the key in the link.</dd></div>
+        </dl>
+        <button id="upload-button" type="button" class="btn btn-primary commit">
+          <span class="commit-action">Encrypt and upload</span>
+          <span class="commit-summary"><span class="visually-hidden">: </span><span id="upload-mode">public link</span><span class="sep" aria-hidden="true">·</span><span class="visually-hidden">, </span><span id="upload-expiry">24 hours</span><span class="sep" aria-hidden="true">·</span><span class="visually-hidden">, </span><span id="upload-limit">1 download</span></span>
+        </button>
+        <p id="upload-status" class="status" role="status"></p>
+        <ol id="upload-steps" class="steps" hidden>
+          <li data-step="stretch" data-state="pending">
+            <span class="step-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 7l10 10M17 7L7 17"/></svg></span>
+            <span class="step-name">Stretching the passphrase</span>
+            <span class="step-detail mono"></span>
+            <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on purpose: every guess at the passphrase costs this much, for anyone who gets the link and the file without it. Usually 1–3 seconds on a phone.</p>
+            <progress max="1" value="0"></progress>
+          </li>
+          <li data-step="encrypt" data-state="pending">
+            <span class="step-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 7l10 10M17 7L7 17"/></svg></span>
+            <span class="step-name">Encrypting on this device</span>
+            <span class="step-detail mono"></span>
+            <progress max="1" value="0"></progress>
+          </li>
+          <li data-step="upload" data-state="pending">
+            <span class="step-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 7l10 10M17 7L7 17"/></svg></span>
+            <span class="step-name">Uploading</span>
+            <span class="step-detail mono"></span>
+            <progress max="1" value="0"></progress>
+          </li>
+        </ol>
+
+        <section id="result" class="result" hidden>
+          <h2 class="result-title"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>Uploaded</h2>
+          <div class="field">
+            <label class="label" for="link">Link</label>
+            <input id="link" class="mono-input" type="text" readonly>
+            <button id="copy-link" type="button" class="btn"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11"/><path d="M15 9V4H4v11h5"/></svg>Copy link</button>
+            <p id="copy-link-status" class="status" role="status"></p>
+          </div>
+          <p id="link-public" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 7.7-1.5"/></svg><span>This link is the whole key. Anyone who has all of it can open the file, and nothing else is asked for, so share it only with the people who should have the file.</span></p>
+          <p id="link-restricted" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span>This link alone does not open the file: the passphrase is needed too. Send the passphrase by a different route from the link.</span></p>
+          <p class="hint">The part after the <code class="mono">#</code> is the key to the file. It never reaches the server: browsers do not send it.</p>
+          <div class="owner">
+            <p class="owner-title"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M16 7l3 3"/></svg><strong>Owner token. Save this token now. It is shown once.</strong></p>
+            <code id="owner-token"></code>
+            <button id="copy-token" type="button" class="btn"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11"/><path d="M15 9V4H4v11h5"/></svg>Copy token</button>
+            <p id="copy-token-status" class="status" role="status"></p>
+            <p class="owner-why">It is the only way to delete the file before it expires, and it cannot be recovered: the server keeps only a fingerprint of it.</p>
+          </div>
+        </section>
+      </aside>
     </div>
-  </section>
-</div>
-</div>
+  </div>
 </main>
 
 <main id="download" hidden>
-  <section class="section receive">
-    <h2>Receive a file</h2>
-    <p id="download-public" class="mode mode-public" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3C9.5 5.6 8.2 8.6 8.2 12s1.3 6.4 3.8 9"/></svg><span><strong>Public link</strong>: this file opens with
-      the link alone. No passphrase is needed.</span></p>
-    <p id="download-restricted" class="mode mode-restricted" hidden><svg class="icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg><span><strong>Passphrase-protected</strong>: this
-      file opens only with the link and its passphrase together.</span></p>
-    <p id="download-status" class="status" role="status"></p>
-    <form id="unlock" hidden>
-      <label class="field" for="unlock-passphrase">Passphrase</label>
-      <div class="copy-row">
-        <input id="unlock-passphrase" type="password" autocomplete="off">
-        <button id="unlock-button" type="submit" class="primary">Open</button>
-      </div>
-    </form>
-    <ol id="download-steps" class="steps" hidden>
-      <li data-step="stretch" data-state="pending">
-        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
-        <span class="step-name">Stretching the passphrase</span>
-        <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on
-          purpose: every guess at the passphrase costs this much, for anyone who gets the link and the
-          file without it. Usually 1–3 seconds on a phone.</p>
-        <progress max="1" value="0"></progress>
-        <span class="step-detail"></span>
-      </li>
-      <li data-step="download" data-state="pending">
-        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
-        <span class="step-name">Downloading the encrypted file</span>
-        <progress max="1" value="0"></progress>
-        <span class="step-detail"></span>
-      </li>
-      <li data-step="decrypt" data-state="pending">
-        <span class="step-mark" aria-hidden="true"><svg class="icon icon-done" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m6 12.5 4 4 8-8.5"/></svg><svg class="icon icon-error" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"><path d="m8 8 8 8M16 8l-8 8"/></svg></span>
-        <span class="step-name">Decrypting and checking every piece</span>
-        <progress max="1" value="0"></progress>
-        <span class="step-detail"></span>
-      </li>
-    </ol>
-  </section>
+  <header class="bar">
+    <a class="wordmark-small" href="/">Sunbird</a>
+  </header>
+  <div class="strip-wrap"><div class="strip" data-dither="wave" data-dither-still><canvas aria-hidden="true"></canvas></div></div>
+  <div class="frame frame-narrow">
+    <h1 class="receive-title">Receive a file.</h1>
+    <p class="lede">It is decrypted in this browser. The server only ever had bytes it cannot read.</p>
 
-  <section id="details" class="section details" hidden>
-    <p id="expired-warning" role="alert" hidden></p>
-    <dl class="facts">
-      <dt>Name</dt><dd id="file-name"></dd>
-      <dt>Size</dt><dd id="file-size"></dd>
-      <dt>Expires</dt><dd id="file-expiry"></dd>
-      <dt>Download limit</dt><dd id="file-limit"></dd>
-    </dl>
-    <button id="download-button" type="button" class="primary">Download</button>
-    <p class="hint">The file is saved to your device once every piece has checked out. This page never
-      opens or shows it.</p>
-  </section>
+    <section class="block">
+      <p id="download-public" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 7.7-1.5"/></svg><span><strong>Public link</strong>: this file opens with the link alone. No passphrase is needed.</span></p>
+      <p id="download-restricted" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>Passphrase-protected</strong>: this file opens only with the link and its passphrase together.</span></p>
+      <p id="download-status" class="status" role="status"></p>
+      <form id="unlock" hidden>
+        <label class="label" for="unlock-passphrase">Passphrase</label>
+        <div class="row">
+          <input id="unlock-passphrase" type="password" autocomplete="off" spellcheck="false">
+          <button id="unlock-button" type="submit" class="btn btn-primary">Open</button>
+        </div>
+      </form>
+      <ol id="download-steps" class="steps" hidden>
+        <li data-step="stretch" data-state="pending">
+          <span class="step-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 7l10 10M17 7L7 17"/></svg></span>
+          <span class="step-name">Stretching the passphrase</span>
+          <span class="step-detail mono"></span>
+          <p class="step-why">Argon2id turns the passphrase into a key using 64 MiB of memory. It is slow on purpose: every guess at the passphrase costs this much, for anyone who gets the link and the file without it. Usually 1–3 seconds on a phone.</p>
+          <progress max="1" value="0"></progress>
+        </li>
+        <li data-step="download" data-state="pending">
+          <span class="step-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 7l10 10M17 7L7 17"/></svg></span>
+          <span class="step-name">Downloading the encrypted file</span>
+          <span class="step-detail mono"></span>
+          <progress max="1" value="0"></progress>
+        </li>
+        <li data-step="decrypt" data-state="pending">
+          <span class="step-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 7l10 10M17 7L7 17"/></svg></span>
+          <span class="step-name">Decrypting and checking every piece</span>
+          <span class="step-detail mono"></span>
+          <progress max="1" value="0"></progress>
+        </li>
+      </ol>
+    </section>
+
+    <section id="details" class="block" hidden>
+      <div id="expired" class="warning" role="alert" hidden>
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3.5L2.5 20h19z"/><path d="M12 10v4.5M12 17v1"/></svg>
+        <div>
+          <p class="warning-title">Past its expiry, by this device’s clock</p>
+          <p id="expired-warning" hidden></p>
+          <p>Either the server kept the file past the limit its sender chose, or this device's clock is wrong. You can still download it: every piece is checked as usual.</p>
+        </div>
+      </div>
+      <dl class="facts">
+        <div><dt>Name</dt><dd id="file-name"></dd></div>
+        <div><dt>Size</dt><dd id="file-size" class="mono"></dd></div>
+        <div><dt>Expires</dt><dd id="file-expiry" class="mono"></dd></div>
+        <div><dt>Download limit</dt><dd id="file-limit" class="mono"></dd></div>
+      </dl>
+      <button id="download-button" type="button" class="btn btn-primary"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg><span>Download</span></button>
+      <p class="hint">The file is saved to your device once every piece has checked out. This page never opens or shows it.</p>
+    </section>
+  </div>
 </main>
 
+<script src="/src/dither.js"></script>
 <script src="/src/argon2.js"></script>
 <script src="/src/crypto.js"></script>
 <script src="/src/app.js"></script>

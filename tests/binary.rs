@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 
 /// The one member's upload token; the config holds only its hash.
 const TOKEN: &str = "binary-test-token";
-/// The one admin's token.
 const ADMIN_TOKEN: &str = "binary-test-admin-token";
 
 fn sha256_hex(s: &str) -> String {
@@ -127,7 +126,6 @@ impl Running {
         serde_json::from_str(body).unwrap()
     }
 
-    /// Uploads `blob`, allowing `max_downloads`, and returns its id.
     fn upload(&self, blob: &[u8], max_downloads: u32) -> String {
         let mut conn = TcpStream::connect(&self.addr).unwrap();
         conn.write_all(
@@ -215,6 +213,12 @@ fn serves_the_built_in_page() {
         ("/src/crypto.js", "web/src/crypto.js"),
         ("/src/argon2.js", "web/src/argon2.js"),
         ("/src/argon2-worker.js", "web/src/argon2-worker.js"),
+        ("/src/dither.js", "web/src/dither.js"),
+        (
+            "/assets/schibsted-grotesk.woff2",
+            "web/assets/schibsted-grotesk.woff2",
+        ),
+        ("/assets/jetbrains-mono.woff2", "web/assets/jetbrains-mono.woff2"),
         (
             "/vendor/hash-wasm/argon2.umd.min.js",
             "web/vendor/hash-wasm/argon2.umd.min.js",

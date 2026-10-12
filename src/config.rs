@@ -65,7 +65,6 @@ pub fn hex(bytes: &[u8]) -> String {
 pub struct Quota {
     /// Bytes of live files at once: freed when a file expires or is deleted.
     pub max_active_bytes: u64,
-    /// Live files at once.
     pub max_active_files: u64,
     /// Bytes uploaded in any 7 days, from the ledger, so deleting a file doesn't
     /// refund it.
@@ -154,7 +153,6 @@ fn find_hash<'a, T>(
 }
 
 impl Config {
-    /// The member an upload token belongs to.
     pub fn member(&self, token: &str) -> Option<&Member> {
         find(&self.members, |m| &m.token_sha256, token)
     }
@@ -384,8 +382,6 @@ fn wait(seconds: i64) -> String {
     };
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
-
-// ---- parsing helpers ----------------------------------------------------------
 
 fn object<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String> {
     v.as_object().ok_or(format!("{what}: a JSON object"))

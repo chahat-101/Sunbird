@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// (tests/fixtures/schema-v5), so older databases keep counting.
 #[derive(Clone, Copy, Debug)]
 pub enum Counter {
-    /// Files stored.
     Uploads,
     /// Blob bytes of the files stored.
     BytesUploaded,

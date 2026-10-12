@@ -103,12 +103,11 @@ fn internal<E: Display>(message: &'static str) -> impl FnOnce(E) -> ApiError {
     }
 }
 
-/// Only the page's own scripts, styles and images, plus WebAssembly for
+/// Only the page's own scripts, styles, images and fonts, plus WebAssembly for
 /// hash-wasm. A backstop in case hostile metadata is ever rendered as HTML.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
-    style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-/// Answers `req`, which came over a connection from `peer`.
 pub async fn handle<B>(app: Arc<App>, peer: IpAddr, req: Request<B>) -> Response<Body>
 where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
@@ -210,8 +209,6 @@ async fn blocking<T: Send + 'static>(
         .await
         .expect("a blocking task panicked")
 }
-
-// ---- upload -----------------------------------------------------------------
 
 /// Cheap refusals first: token (401), rate (429), limits (400), size or
 /// quota (413), disk floor (507). Then the body streams to tmp/, cut off at
@@ -379,8 +376,6 @@ impl Drop for TempFile {
     }
 }
 
-// ---- meta and download ------------------------------------------------------
-
 /// Sends the first min(limit, size) bytes, raw; the server never looks inside
 /// (§3). With `claim`, a download is claimed first and held until the end.
 async fn serve(
@@ -498,8 +493,6 @@ impl HttpBody for Blob {
         SizeHint::with_exact(self.left)
     }
 }
-
-// ---- delete -----------------------------------------------------------------
 
 async fn delete(
     app: Arc<App>,
@@ -720,7 +713,8 @@ async fn signin_finish(app: Arc<App>, query: Option<&str>) -> Response<Body> {
 fn signin_page(status: StatusCode, message: &str, token: Option<&str>) -> Response<Body> {
     let token_box = token.map_or(String::new(), |token| {
         format!(
-            r#"<div class="token-box"><code id="owner-token">{token}</code>
+            r#"<div class="token-box"><div class="copy-row"><code id="owner-token">{token}</code><button type="button" data-copy="owner-token">Copy token</button></div>
+<p class="status" role="status" data-copy-status></p>
 <p>Copy it now. It is shown once and the server keeps only a fingerprint of it.
 Paste it into the upload page. Signing in again gives a new token and cancels this one.</p></div>"#
         )
@@ -734,6 +728,7 @@ Paste it into the upload page. Signing in again gives a new token and cancels th
 <meta name="referrer" content="no-referrer">
 <title>Sunbird</title>
 <link rel="stylesheet" href="/app.css">
+<script src="/src/theme.js"></script>
 <header class="masthead"><h1 class="wordmark">Sunbird</h1></header>
 <main>
 <section class="section"><p>{message}</p>
@@ -749,8 +744,6 @@ Paste it into the upload page. Signing in again gives a new token and cancels th
         .expect("valid response")
 }
 
-// ---- stats ------------------------------------------------------------------
-
 /// `GET /admin/stats`: totals only, never a file or a member.
 fn stats(app: &App, token: Option<&str>) -> Result<Response<Body>, ApiError> {
     token
@@ -759,13 +752,11 @@ fn stats(app: &App, token: Option<&str>) -> Result<Response<Body>, ApiError> {
     Ok(json(StatusCode::OK, &app.counters.json()))
 }
 
-// ---- client -----------------------------------------------------------------
-
 /// The page, served at / and at /d/<anything>: the link a recipient opens.
 const INDEX: &[u8] = include_bytes!("../web/index.html");
 
 /// The only files served from web/. No tests, no listings.
-const ASSETS: [(&str, &str, &[u8]); 9] = [
+const ASSETS: [(&str, &str, &[u8]); 15] = [
     (
         "/app.css",
         "text/css; charset=utf-8",
@@ -780,6 +771,16 @@ const ASSETS: [(&str, &str, &[u8]); 9] = [
         "/src/crypto.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../web/src/crypto.js"),
+    ),
+    (
+        "/src/theme.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/src/theme.js"),
+    ),
+    (
+        "/src/dither.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../web/src/dither.js"),
     ),
     (
         "/src/argon2.js",
@@ -811,6 +812,26 @@ const ASSETS: [(&str, &str, &[u8]); 9] = [
         "image/jpeg",
         include_bytes!("../web/assets/sunbird.jpg"),
     ),
+    (
+        "/assets/schibsted-grotesk.woff2",
+        "font/woff2",
+        include_bytes!("../web/assets/schibsted-grotesk.woff2"),
+    ),
+    (
+        "/assets/schibsted-grotesk.OFL.txt",
+        "text/plain; charset=utf-8",
+        include_bytes!("../web/assets/schibsted-grotesk.OFL.txt"),
+    ),
+    (
+        "/assets/jetbrains-mono.woff2",
+        "font/woff2",
+        include_bytes!("../web/assets/jetbrains-mono.woff2"),
+    ),
+    (
+        "/assets/jetbrains-mono.OFL.txt",
+        "text/plain; charset=utf-8",
+        include_bytes!("../web/assets/jetbrains-mono.OFL.txt"),
+    ),
 ];
 
 fn client_file(path: &str) -> Option<Response<Body>> {
@@ -837,8 +858,6 @@ fn client_file(path: &str) -> Option<Response<Body>> {
             .expect("valid response"),
     )
 }
-
-// ---- helpers ----------------------------------------------------------------
 
 fn json(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
     let mut text = value.to_string();
@@ -1511,6 +1530,8 @@ pub(crate) mod tests {
             ("/app.css", "text/css; charset=utf-8"),
             ("/src/app.js", "text/javascript; charset=utf-8"),
             ("/src/crypto.js", "text/javascript; charset=utf-8"),
+            ("/src/theme.js", "text/javascript; charset=utf-8"),
+            ("/src/dither.js", "text/javascript; charset=utf-8"),
             ("/src/argon2.js", "text/javascript; charset=utf-8"),
             ("/src/argon2-worker.js", "text/javascript; charset=utf-8"),
             (
@@ -1520,6 +1541,10 @@ pub(crate) mod tests {
             ("/vendor/hash-wasm/LICENSE", "text/plain; charset=utf-8"),
             ("/assets/sunbird.webp", "image/webp"),
             ("/assets/sunbird.jpg", "image/jpeg"),
+            ("/assets/schibsted-grotesk.woff2", "font/woff2"),
+            ("/assets/schibsted-grotesk.OFL.txt", "text/plain; charset=utf-8"),
+            ("/assets/jetbrains-mono.woff2", "font/woff2"),
+            ("/assets/jetbrains-mono.OFL.txt", "text/plain; charset=utf-8"),
         ] {
             let r = get(&s, path).await;
             assert_eq!(r.status, StatusCode::OK, "GET {path}");
