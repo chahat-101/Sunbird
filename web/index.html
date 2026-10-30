@@ -24,6 +24,7 @@
 
   <div class="frame">
     <p class="lede">Send one file. It is encrypted in this browser before it is uploaded. The server stores bytes it cannot read, and deletes them after the time or number of downloads you choose.</p>
+    <p id="request-offer" class="offer">Want someone to send you a file instead? <a href="/r">Request a file</a>. You get a link with no key in it, which is safe to post anywhere.</p>
 
     <div class="layout">
       <div class="sheet">
@@ -36,7 +37,18 @@
           </label>
         </section>
 
-        <section class="block">
+        <section id="request-for" class="block" hidden>
+          <h2>Who can open it</h2>
+          <p class="note"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>Sent to a request</strong>: only the browser that made this request can open the file. The link you get has no key in it.</span></p>
+          <div class="field">
+            <p class="label">Fingerprint</p>
+            <p id="sender-fingerprint" class="fingerprint"></p>
+            <p class="hint">Ask the person who made the request what fingerprint their page shows, by some other way than the one the link came by. If it is not the same, someone changed the link: do not upload.</p>
+          </div>
+          <label class="check"><input id="fingerprint-checked" type="checkbox"><span>The fingerprint matches</span></label>
+        </section>
+
+        <section id="who" class="block">
           <h2>Who can open it</h2>
           <label class="check"><input id="protect" type="checkbox"><span>Require a passphrase</span></label>
           <p id="mode-public" class="note"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 7.7-1.5"/></svg><span><strong>Public link</strong>: anyone who has the link can open this file. There is no passphrase or other second factor.</span></p>
@@ -91,7 +103,7 @@
       <aside class="send">
         <dl class="exposure">
           <div><dt>The server receives</dt><dd>The encrypted file and its size, the expiry and download limit, your upload token, and your network address.</dd></div>
-          <div><dt>It never receives</dt><dd>The file’s name, type or contents, the passphrase, or the key in the link.</dd></div>
+          <div><dt>It never receives</dt><dd id="never-receives">The file’s name, type or contents, the passphrase, or the key in the link.</dd></div>
         </dl>
         <button id="upload-button" type="button" class="btn btn-primary commit">
           <span class="commit-action">Encrypt and upload</span>
@@ -130,7 +142,8 @@
           </div>
           <p id="link-public" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 7.7-1.5"/></svg><span>This link is the whole key. Anyone who has all of it can open the file, and nothing else is asked for, so share it only with the people who should have the file.</span></p>
           <p id="link-restricted" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span>This link alone does not open the file: the passphrase is needed too. Send the passphrase by a different route from the link.</span></p>
-          <p class="hint">The part after the <code class="mono">#</code> is the key to the file. It never reaches the server: browsers do not send it.</p>
+          <p id="link-request" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span>This link has no key in it. Send it to the person who made the request: it opens only in the browser they made the request in.</span></p>
+          <p id="link-key-note" class="hint">The part after the <code class="mono">#</code> is the key to the file. It never reaches the server: browsers do not send it.</p>
           <div class="owner">
             <p class="owner-title"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M16 7l3 3"/></svg><strong>Owner token. Save this token now. It is shown once.</strong></p>
             <code id="owner-token"></code>
@@ -156,6 +169,7 @@
     <section class="block">
       <p id="download-public" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 7.7-1.5"/></svg><span><strong>Public link</strong>: this file opens with the link alone. No passphrase is needed.</span></p>
       <p id="download-restricted" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>Passphrase-protected</strong>: this file opens only with the link and its passphrase together.</span></p>
+      <p id="download-request" class="note" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>Sent to your request</strong>: this file opens only in the browser that made the request.</span></p>
       <p id="download-status" class="status" role="status"></p>
       <form id="unlock" hidden>
         <label class="label" for="unlock-passphrase">Passphrase</label>
@@ -204,6 +218,43 @@
       </dl>
       <button id="download-button" type="button" class="btn btn-primary"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg><span>Download</span></button>
       <p class="hint">The file is saved to your device once every piece has checked out. This page never opens or shows it.</p>
+    </section>
+  </div>
+</main>
+
+<main id="request" hidden>
+  <header class="bar">
+    <a class="wordmark-small" href="/">Sunbird</a>
+  </header>
+  <div class="strip-wrap"><div class="strip" data-dither="wave" data-dither-still><canvas aria-hidden="true"></canvas></div></div>
+  <div class="frame frame-narrow">
+    <h1 class="receive-title">Request a file.</h1>
+    <p class="lede">Make a link that someone can use to send you a file. The link holds no secret, so it is safe to post anywhere. Whatever is sent to it opens only in this browser.</p>
+
+    <section class="block">
+      <button id="request-button" type="button" class="btn btn-primary">Make a request link</button>
+      <p id="request-status" class="status" role="status"></p>
+      <div id="request-made" class="request-made" hidden>
+        <div class="field">
+          <label class="label" for="request-link">Request link</label>
+          <input id="request-link" class="mono-input" type="text" readonly>
+          <button id="copy-request" type="button" class="btn"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11"/><path d="M15 9V4H4v11h5"/></svg>Copy link</button>
+          <p id="copy-request-status" class="status" role="status"></p>
+        </div>
+        <div class="field">
+          <p class="label">Fingerprint</p>
+          <p id="request-fingerprint" class="fingerprint"></p>
+          <p class="hint">The sender sees a fingerprint when they open the link. Before they upload, check with them that it is the same as this one. They then send you a link back: open it in this browser.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>Waiting requests</h2>
+      <p id="requests-empty" class="hint">None in this browser.</p>
+      <ul id="requests" class="requests"></ul>
+      <p id="private-note" class="note"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="5" y="11" width="14" height="9"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><span><strong>In a private window</strong>, the key is lost when the window closes, and nothing sent to the request can be opened after that.</span></p>
+      <p class="hint">Each request keeps a key in this browser until a file sent to it has been opened, or for 7 days. Anyone who can use this browser profile can use that key until then. One request takes one file, and at most 20 can wait at once.</p>
     </section>
   </div>
 </main>

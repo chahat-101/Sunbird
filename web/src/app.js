@@ -1,5 +1,6 @@
-// The Sunbird page (protocol.md §10). `/` uploads, `/d/<id>#<key>` downloads.
-// The crypto lives in crypto.js; this file moves bytes and sets text.
+// The Sunbird page (protocol.md §10). `/` uploads, `/d/<id>#<key>` downloads,
+// `/r` makes request links and `/r#<request key>` sends to one. The crypto
+// lives in crypto.js; this file moves bytes and sets text.
 //
 // Rules to keep:
 // - Decrypted metadata is hostile. Use textContent only, ignore `type`, never
@@ -19,6 +20,11 @@
   const DOWNLOAD_LIMITS = new Set([0, 1, 5, 10]);
   const ID_PATTERN = /^[A-Za-z0-9_-]{16}$/;
   const TOKEN_KEY = 'sunbird.uploadToken';
+  const REQUEST_LIFETIME = 7 * 24 * 3600 * 1000;
+  const MAX_REQUESTS = 20;
+  const NO_X25519 = 'This browser cannot make request links: its WebCrypto has no X25519. Try a recent version of another browser.';
+  const SIGN_IN_TO_SEND = 'You need to sign in to send a file. Use “Sign in with Google” on this page, then open this request link again. If this server has no sign-in, ask its admin for access.';
+  const NO_X25519_OPEN = 'This browser cannot open files sent to a request: its WebCrypto has no X25519. Open the link in the browser that made the request.';
 
   // The server gives one answer for expired, used up, deleted or never existed.
   const NO_FILE = 'There is no file at this link: it expired, was deleted, or the link is wrong.';
@@ -76,6 +82,11 @@
       // Already written for people.
       case 'needs-newer-version': // §5
       case 'unknown-version':     // §9, verbatim
+      case 'other-browser':       // §5
+      case 'no-fragment':
+      case 'request-link':
+      case 'no-x25519':
+      case 'request':
       case 'name-too-long':
       case 'passphrase-worker':
       case 'link':
@@ -221,8 +232,134 @@
     }
   }
 
+  // The one key Sunbird keeps (DECISIONS.md D11): a request's private key, as a
+  // non-extractable CryptoKey in IndexedDB. File keys, fragments and
+  // passphrases are never stored.
+  function requestStore(mode, use) {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open('sunbird', 1);
+      open.onupgradeneeded = () => open.result.createObjectStore('requests', { keyPath: 'id' });
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction('requests', mode);
+        const result = use(tx.objectStore('requests'));
+        tx.oncomplete = () => {
+          db.close();
+          resolve(result instanceof IDBRequest ? result.result : result);
+        };
+        tx.onabort = () => {
+          db.close();
+          reject(tx.error);
+        };
+      };
+    });
+  }
+
+  // Deletes expired requests and returns the rest. Never creates the database.
+  async function liveRequests() {
+    if (indexedDB.databases && !(await indexedDB.databases()).some((d) => d.name === 'sunbird')) return [];
+    return requestStore('readwrite', (store) => {
+      const live = [];
+      store.openCursor().onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (!cursor) return;
+        if (cursor.value.expiresAt <= Date.now()) cursor.delete();
+        else live.push(cursor.value);
+        cursor.continue();
+      };
+      return live;
+    });
+  }
+
+  const forgetRequest = (id) => requestStore('readwrite', (store) => store.delete(id));
+
+  async function listRequests() {
+    const requests = (await liveRequests()).sort((a, b) => a.createdAt - b.createdAt);
+    $('requests').replaceChildren(...requests.map((request) => {
+      const li = document.createElement('li');
+      const what = document.createElement('div');
+      const fingerprint = document.createElement('code');
+      fingerprint.textContent = request.fingerprint;
+      const expiry = document.createElement('p');
+      expiry.className = 'hint';
+      expiry.textContent = `Made ${new Date(request.createdAt).toLocaleString()}. Expires ${new Date(request.expiresAt).toLocaleString()}.`;
+      what.append(fingerprint, expiry);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn';
+      remove.textContent = 'Delete';
+      remove.setAttribute('aria-label', `Delete the request ${request.fingerprint}`);
+      remove.addEventListener('click', async () => {
+        remove.disabled = true;
+        try {
+          await forgetRequest(request.id);
+        } catch (err) {
+          setStatus($('request-status'), 'error', `Could not delete the request from this browser (${err.message}).`);
+        }
+        await listRequests();
+      });
+      li.append(what, remove);
+      return li;
+    }));
+    $('requests-empty').hidden = requests.length > 0;
+    return requests;
+  }
+
+  async function makeRequest() {
+    const status = $('request-status');
+    const button = $('request-button');
+    button.disabled = true;
+    try {
+      if (!(await C.x25519Available())) throw coded('no-x25519', NO_X25519);
+      if ((await liveRequests()).length >= MAX_REQUESTS) {
+        throw coded('request', `This browser already has ${MAX_REQUESTS} requests waiting, the most it keeps. Delete one first.`);
+      }
+      const { privateKey, publicKey } = await C.generateRequestKey();
+      const fingerprint = await C.requestFingerprint(publicKey);
+      const createdAt = Date.now();
+      try {
+        await requestStore('readwrite', (store) => store.add({
+          id: crypto.randomUUID(), privateKey, publicKey, fingerprint, createdAt, expiresAt: createdAt + REQUEST_LIFETIME,
+        }));
+      } catch (err) {
+        throw coded('request', `This browser would not keep the request key (${err.message}), so no request was made.`);
+      }
+      $('request-link').value = `${location.origin}/r#${C.encodeRequestKey(publicKey)}`;
+      $('request-fingerprint').textContent = fingerprint;
+      setStatus($('copy-request-status'), '', '');
+      $('request-made').hidden = false;
+      await listRequests();
+      setStatus(status, 'done', 'Request made. Send the link to the person who has the file.');
+    } catch (err) {
+      setStatus(status, 'error', explain(err));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function showRequests() {
+    $('request').hidden = false;
+    catchDrops(null);
+    $('copy-request').addEventListener('click', () => copy($('request-link'), $('copy-request-status')));
+    $('request-button').addEventListener('click', makeRequest);
+    if (!(await C.x25519Available())) {
+      $('request-button').disabled = true;
+      return setStatus($('request-status'), 'error', NO_X25519);
+    }
+    try {
+      await listRequests();
+    } catch (err) {
+      setStatus($('request-status'), 'error', `This browser cannot keep request keys (${err.message}), so it cannot make request links.`);
+      $('request-button').disabled = true;
+    }
+  }
+
   const STRETCH_DETAIL = 'This page is still working: ';
   let uploading = false;
+  // On /r#<key>: the request key, once it has decoded.
+  let sending = false;
+  let recipient;
 
   // Storage can throw (private windows); then the field just starts empty.
   function rememberedToken() {
@@ -307,6 +444,32 @@
     $('copy-token').addEventListener('click', () => copy($('owner-token'), $('copy-token-status')));
   }
 
+  // The upload page, sending to a request: no passphrase, one 0x02 entry.
+  async function showSend() {
+    sending = true;
+    showUpload();
+    const protect = $('protect');
+    if (protect.checked) {
+      protect.checked = false;
+      protect.dispatchEvent(new Event('change'));
+    }
+    $('who').hidden = true;
+    $('request-offer').hidden = true;
+    $('request-for').hidden = false;
+    $('upload-mode').textContent = 'for this request';
+    $('never-receives').textContent = 'The file’s name, type or contents, or the key that opens it.';
+    const button = $('upload-button');
+    button.disabled = true;
+    try {
+      const key = await C.decodeRequestKey(location.hash.slice(1));
+      $('sender-fingerprint').textContent = await C.requestFingerprint(key);
+      recipient = key;
+      button.disabled = false;
+    } catch (err) {
+      setStatus($('upload-status'), 'error', explain(err));
+    }
+  }
+
   // XHR, not fetch: only XHR reports upload progress everywhere.
   function post(url, body, token, onProgress) {
     return new Promise((resolve, reject) => {
@@ -342,7 +505,11 @@
     const file = $('file').files[0];
     if (!file) return setStatus(status, 'error', 'Choose a file first.');
     if (file.size > MAX_PLAINTEXT) return setStatus(status, 'error', TOO_LARGE);
-    const restricted = $('protect').checked;
+    if (sending && !recipient) return;
+    if (sending && !$('fingerprint-checked').checked) {
+      return setStatus(status, 'error', 'Check the fingerprint with the person who made the request, then tick “The fingerprint matches”.');
+    }
+    const restricted = !sending && $('protect').checked;
     const passphrase = restricted ? $('passphrase').value : undefined;
     if (restricted && passphrase === '') {
       return setStatus(status, 'error', 'Enter a passphrase, or untick “Require a passphrase”.');
@@ -354,7 +521,9 @@
     }
     // Tokens never contain spaces; trim paste leftovers.
     const token = $('upload-token').value.trim();
-    if (token === '') return setStatus(status, 'error', 'Enter your upload token. The server\'s admin gives one to each member.');
+    if (token === '') {
+      return setStatus(status, 'error', sending ? SIGN_IN_TO_SEND : 'Enter your upload token. The server\'s admin gives one to each member.');
+    }
 
     // Computed once: the same value is sealed in the file and sent to the server (§10).
     const now = Math.floor(Date.now() / 1000);
@@ -378,6 +547,7 @@
         name: file.name,
         type: file.type || 'application/octet-stream',
         passphrase,
+        recipient,
         expiresAt,
         maxDownloads,
         onProgress({ stage, done, total }) {
@@ -421,9 +591,11 @@
 
       // Remember the token only once the server has accepted it.
       if ($('remember-token').checked) rememberToken(token);
-      $('link').value = `${location.origin}/d/${id}#${fragment}`;
-      $('link-public').hidden = restricted;
+      $('link').value = sending ? `${location.origin}/d/${id}` : `${location.origin}/d/${id}#${fragment}`;
+      $('link-public').hidden = restricted || sending;
       $('link-restricted').hidden = !restricted;
+      $('link-request').hidden = !sending;
+      $('link-key-note').hidden = sending;
       $('owner-token').textContent = ownerToken;
       setStatus($('copy-link-status'), '', '');
       setStatus($('copy-token-status'), '', '');
@@ -432,7 +604,7 @@
       $('result').scrollIntoView({ block: 'start' });
     } catch (err) {
       flow.fail();
-      setStatus(status, 'error', explain(err, restricted));
+      setStatus(status, 'error', sending && err.code === 'not-authorised' ? SIGN_IN_TO_SEND : explain(err, restricted));
     } finally {
       uploading = false;
       button.disabled = false;
@@ -504,26 +676,31 @@
     const status = $('download-status');
     const flow = steps($('download-steps'));
 
-    // §10 steps 1–2.
+    // §10 steps 1–2. No fragment at all means a request link (§2.1).
     let secret;
     let preview;
     try {
       if (!ID_PATTERN.test(id)) throw coded('link', 'This link is damaged: the file ID is malformed.');
-      try {
-        secret = C.decodeFragment(location.hash.slice(1));
-      } catch (err) {
-        throw coded('link', `This link is damaged or incomplete. ${err.message}.`);
+      if (location.hash.length > 1) {
+        try {
+          secret = C.decodeFragment(location.hash.slice(1));
+        } catch (err) {
+          throw coded('link', `This link is damaged or incomplete. ${err.message}.`);
+        }
       }
       setStatus(status, 'busy', 'Fetching the file details…', 'meta');
       preview = C.parseHeader(await fetchBytes(`/api/meta/${id}`));
     } catch (err) {
       return setStatus(status, 'error', explain(err, false));
     }
-    const restricted = (preview.flags & C.FLAG_PASSPHRASE) !== 0;
+    // A request file asks for nothing; its kind is said once it has opened.
+    const restricted = secret !== undefined && (preview.flags & C.FLAG_PASSPHRASE) !== 0;
     // Say which kind of link this is before asking for anything. A server that
     // lies about it just gets a file that won't open (§7).
-    $('download-public').hidden = restricted;
-    $('download-restricted').hidden = !restricted;
+    if (secret !== undefined) {
+      $('download-public').hidden = restricted;
+      $('download-restricted').hidden = !restricted;
+    }
 
     // We know the verified limits by now, so we can guess why the file is gone.
     function gone() {
@@ -562,6 +739,32 @@
       }
     }
 
+    // §10 request download, steps 3–5. Only the preview has been fetched, so a
+    // browser without the key uses up no download.
+    async function openRequest() {
+      setStatus(status, 'busy', 'Looking for the request key in this browser…', 'open');
+      try {
+        const supported = await C.x25519Available();
+        let keys = [];
+        if (supported) {
+          try { keys = await liveRequests(); } catch (_) { /* no storage, so no keys */ }
+        }
+        let unlocked;
+        try {
+          unlocked = await C.unlockRequest(preview, keys);
+        } catch (err) {
+          throw err.code === 'other-browser' && !supported ? coded('no-x25519', NO_X25519_OPEN) : err;
+        }
+        const metadata = await C.decryptMetadata(unlocked.fileKey, preview.headerCore);
+        $('download-request').hidden = false;
+        showDetails(metadata);
+        $('download-button').addEventListener('click', () => download(unlocked.fileKey, unlocked.requestKey));
+        setStatus(status, 'ready', 'Ready to download.');
+      } catch (err) {
+        setStatus(status, 'error', explain(err, false));
+      }
+    }
+
     function showDetails(metadata) {
       $('file-name').textContent = metadata.name;
       $('file-size').textContent = metadata.size < 1024
@@ -584,7 +787,7 @@
 
     // §10 step 6.
     let downloading = false;
-    async function download(fileKey) {
+    async function download(fileKey, request) {
       if (downloading) return;
       downloading = true;
       const button = $('download-button');
@@ -608,10 +811,20 @@
         const { metadata, plaintext } = await C.decryptFile(fileKey, preview, blob,
           ({ done, total }) => flow.measure('decrypt', done, total, percent(done, total)));
         flow.done('decrypt', 'Every piece checked.');
+        // One file per request: the key goes as soon as its file has checked out.
+        let forgot = '';
+        if (request) {
+          try {
+            await forgetRequest(request.id);
+            forgot = ' The request is used up, so its key was deleted from this browser.';
+          } catch (_) {
+            forgot = ' The request key could not be deleted from this browser: delete it on the request page.';
+          }
+        }
         save(plaintext, metadata.name);
-        setStatus(status, 'done', preview.maxDownloads === 1
+        setStatus(status, 'done', (preview.maxDownloads === 1
           ? 'Downloaded. That was this link’s only download, so the server deletes the file now.'
-          : 'Downloaded.');
+          : 'Downloaded.') + forgot);
       } catch (err) {
         flow.fail();
         setStatus(status, 'error', explain(err, restricted));
@@ -621,6 +834,7 @@
       }
     }
 
+    if (secret === undefined) return openRequest();
     if (!restricted) return open(undefined);
     $('unlock').hidden = false;
     setStatus(status, 'waiting', 'This file needs a passphrase.');
@@ -634,7 +848,14 @@
     });
   }
 
+  // Expired request keys go on every page load.
+  liveRequests().catch(() => {});
   const match = location.pathname.match(/^\/d\/([^/]*)$/);
   if (match) showDownload(match[1]);
-  else showUpload();
+  else if (location.pathname === '/r') {
+    // A new request key in the address bar is a new page.
+    window.addEventListener('hashchange', () => location.reload());
+    if (location.hash.length > 1) showSend();
+    else showRequests();
+  } else showUpload();
 })();

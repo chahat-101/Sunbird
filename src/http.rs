@@ -752,7 +752,8 @@ fn stats(app: &App, token: Option<&str>) -> Result<Response<Body>, ApiError> {
     Ok(json(StatusCode::OK, &app.counters.json()))
 }
 
-/// The page, served at / and at /d/<anything>: the link a recipient opens.
+/// The page, served at /, at /r (request links) and at /d/<anything>: the
+/// link a recipient opens.
 const INDEX: &[u8] = include_bytes!("../web/index.html");
 
 /// The only files served from web/. No tests, no listings.
@@ -836,6 +837,7 @@ const ASSETS: [(&str, &str, &[u8]); 15] = [
 
 fn client_file(path: &str) -> Option<Response<Body>> {
     let page = path == "/"
+        || path == "/r"
         || path
             .strip_prefix("/d/")
             .is_some_and(|id| !id.is_empty() && !id.contains('/'));
@@ -1512,7 +1514,7 @@ pub(crate) mod tests {
     async fn client_routes() {
         let s = server();
         let page = fs::read("web/index.html").unwrap();
-        for path in ["/", "/d/AAAAAAAAAAAAAAAA", "/d/anything"] {
+        for path in ["/", "/r", "/d/AAAAAAAAAAAAAAAA", "/d/anything"] {
             let r = get(&s, path).await;
             assert_eq!(r.status, StatusCode::OK, "GET {path}");
             assert!(r.body == page, "GET {path}: not index.html");
@@ -1562,6 +1564,8 @@ pub(crate) mod tests {
             "/index.html/x",
             "/d/",
             "/d/a/b",
+            "/r/",
+            "/r/x",
         ] {
             assert_eq!(
                 get(&s, path).await.status,

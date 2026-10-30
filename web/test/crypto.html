@@ -67,6 +67,23 @@ const KAT = {
   metadataIv: 'f55e6e272d95cdc2cd668e2c',
   headerPrefix: '0100101112131415161718191a1b1c1d1e1f000000006ab13b8000000001',
   metadata: { name: 'नमस्ते.txt', type: 'text/plain', size: 3 },
+  // §5 type 0x02 and §2.1 request keys, over salt and fileKey above.
+  // recipient private key 50..6f, ephemeral private key 70..8f, iv 90..9b.
+  recipientPkcs8: '302e020100300506032b656e04220420505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f',
+  recipientPub: '392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c',
+  requestKey: 'OS0XSjizsb6vrx_oJIcIQcX6UxvG6v22QCwSRmRIjBw',
+  fingerprint: 'AME4 XQ7P V4QQ',
+  recipientWrappingKey: 'd030ca3863b577d6017ae7bf7243cb25dfd6a67ed81bd32a8f1871afd4fc08be',
+  entryRecipient: '02005c23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c4823909192939495969798999a9bd97249774ca938773584249bcbeff976d754973acebfd98e9b683cb43f288542d0f61e13433242d4d1bbe6b7379a6ec1',
+  // Little-endian u = 0, 1, two points of order 8, and p - 1. Python refuses each.
+  lowOrder: [
+    '0000000000000000000000000000000000000000000000000000000000000000',
+    '0100000000000000000000000000000000000000000000000000000000000000',
+    'e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800',
+    '5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157',
+    'ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f',
+  ],
+
   metadataCt: '995f5767f4cbe7513dcd306457d8deeb70189417404710494a739a79e5b391c1682b95f0cc2d2356eee6151e4c019540cd584d339dbdae6ca11495a273274d4e8f728fb2cd36e1dc3ee91c4a9a7de592d5b4216bc7b15e5b284c3d9243cbfbd1c3aeaf37bec8b4b5c6de36c7d9bb662a68da93fa0d3ed3ae33fa8317ada0a32a66beebbe238223db3907a10f6d337a885ff9c07decb9fa46de98da82b289b8c787b776b5c8d82d44f8b3028188fa8be5f858029836f2316fc6f5b25d2846f721e4eafce227c2c546f7364ed8913e409fad83bb2e987b6ef6a2e1f4b6c866207a81367054709fdfb778df8fb9ef6b0f2c49cf10fc01b3a461f28450cd3776aa3d506b6df40cff906266f70eb07952862040dac4faf617c826aeda7dc0841fcf9e6970615fa42e1ec9265331594135b0f0def8c3b2fbce59783e8b1015720eb8e8b60aa344c74122f7d4eb4d046e7db3777804182ba977998f0cf0a725175404bf4ace3a75a0f5e136fc8b7afe1988c25ca47728123cf8762052fc66e53b37c6ea85cf76917646a0c3ddc64bce233ab7583b6b1bb071410e8622185f3007a704155266f8a9bea0c5dac081aaab3da9e67d3f4867cd41eeeed151277598b0ea66591339ecd17859df6fe4cb0636dbacce0cd2a160399e86d139a63a6f2082e48fc029eddae992c7844d84a79c7ca29853c45bc5b66687ee8b180fa31f28d55fbfd1da709a87ffda2d40b9337be1881b5381',
 };
 
@@ -294,8 +311,10 @@ test('wrap: fresh IV every time; any flipped byte or bad framing fails to unwrap
     const t = e1.slice(); t[i] ^= 0x01;
     await rejects(() => C.unwrapSlot(wk, slotOf(t)), `flipped ${why} byte`, 'wrong-passphrase');
   }
-  const relabeled = e1.slice(); relabeled[0] = 0x02;
-  await rejects(() => C.unwrapSlot(wk, slotOf(relabeled)), 'type relabeled', 'needs-newer-version');
+  const relabeled = e1.slice(); relabeled[0] = 0x7f;
+  await rejects(() => C.unwrapSlot(wk, slotOf(relabeled)), 'type relabeled to an unknown type', 'needs-newer-version');
+  relabeled[0] = 0x02;
+  await rejects(() => C.unwrapSlot(wk, slotOf(relabeled)), 'type relabeled to 0x02', 'other-browser');
   const badLen = e1.slice(0, 62); badLen[2] = 0x3b;
   await rejects(() => C.unwrapSlot(wk, slotOf(badLen)), '0x01 entry with body length 59', 'wrong-passphrase');
   await rejects(() => C.unwrapSlot(wk, slotOf(e1.subarray(0, 62))), 'truncated entry', 'malformed');
@@ -315,8 +334,8 @@ test('slot (§5): two 0x01 entries where only the second unwraps — succeeds', 
   eq(await C.unwrapSlot(mine, slotOf(theirEntry, myEntry)), fileKey, 'second of two 0x01 entries');
   eq(await C.unwrapSlot(theirs, slotOf(theirEntry, myEntry)), fileKey, 'first of two 0x01 entries');
   const broken = theirEntry.slice(); broken[40] ^= 0xff;
-  eq(await C.unwrapSlot(mine, slotOf(broken, entryOf(0x02, 92), myEntry)), fileKey,
-    'after a damaged 0x01 and an unknown 0x02');
+  eq(await C.unwrapSlot(mine, slotOf(broken, entryOf(0x7f, 92), myEntry)), fileKey,
+    'after a damaged 0x01 and an unknown 0x7f');
 });
 
 test('slot (§5): two 0x01 entries where neither unwraps — wrong passphrase, not unknown format', async () => {
@@ -326,12 +345,12 @@ test('slot (§5): two 0x01 entries where neither unwraps — wrong passphrase, n
   const b = await C.wrapFileKey(await publicWrappingKey(C.generateFragmentSecret(), salt), fileKey);
   const mine = await publicWrappingKey(C.generateFragmentSecret(), salt);
   await rejects(() => C.unwrapSlot(mine, slotOf(a, b)), 'two foreign 0x01 entries', 'wrong-passphrase');
-  await rejects(() => C.unwrapSlot(mine, slotOf(entryOf(0x02, 92), a, b)), 'with an unknown entry too', 'wrong-passphrase');
+  await rejects(() => C.unwrapSlot(mine, slotOf(entryOf(0x7f, 92), a, b)), 'with an unknown entry too', 'wrong-passphrase');
 });
 
 test('slot (§5): no entry of a known type — needs a newer version', async () => {
   const wk = await publicWrappingKey(KAT.fragmentSecret, KAT.salt);
-  const err = await rejects(() => C.unwrapSlot(wk, slotOf(entryOf(0x02, 92), entryOf(0x7f, 0))),
+  const err = await rejects(() => C.unwrapSlot(wk, slotOf(entryOf(0x7e, 92), entryOf(0x7f, 0))),
     'only unknown types', 'needs-newer-version');
   eq(err.message, 'This link needs a newer version of Sunbird.', 'message');
 });
@@ -835,6 +854,122 @@ test('file (§7): downloaded header_core must equal the preview; a slot grown si
   }
   const truncated = bytes.subarray(0, bytes.length - 1);
   await rejects(() => C.decryptFile(fileKey, preview, truncated), 'blob one byte short', 'corrupt');
+});
+
+// ---- §2.1, §5 request keys and type 0x02 -----------------------------------
+
+async function katRequestKey() {
+  const privateKey = await crypto.subtle.importKey('pkcs8', unhex(KAT.recipientPkcs8), { name: 'X25519' }, false, ['deriveBits']);
+  return { privateKey, publicKey: unhex(KAT.recipientPub) };
+}
+// A preview-shaped object: unlockRequest reads only slot and salt.
+const withSlot = (salt, ...entries) => ({ salt, slot: slotOf(...entries) });
+
+test('0x02 KAT: request key encoding, fingerprint, and an entry produced by the independent implementation', async () => {
+  eq(C.encodeRequestKey(unhex(KAT.recipientPub)), KAT.requestKey, 'request key encoding');
+  eq(await C.decodeRequestKey(KAT.requestKey), unhex(KAT.recipientPub), 'request key decoding');
+  eq(await C.requestFingerprint(unhex(KAT.recipientPub)), KAT.fingerprint, 'fingerprint');
+  const key = await katRequestKey();
+  const { fileKey, requestKey } = await C.unlockRequest(withSlot(KAT.salt, unhex(KAT.entryRecipient)), [key]);
+  eq(fileKey, KAT.fileKey, 'file_key from the vector entry');
+  if (requestKey !== key) throw new Error('unlockRequest did not say which key unwrapped');
+  // The AAD is version ‖ type = 01 02: the vector's ciphertext opens under it directly.
+  const entry = unhex(KAT.entryRecipient);
+  const wk = await crypto.subtle.importKey('raw', unhex(KAT.recipientWrappingKey), 'AES-GCM', false, ['decrypt']);
+  eq(new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: entry.subarray(35, 47), additionalData: new Uint8Array([1, 2]) },
+    wk, entry.subarray(47))), KAT.fileKey, 'vector opens under its wrapping key with AAD 01 02');
+});
+
+test('0x02 round trip: encryptFile with a request key → parseHeader → unlockRequest → decryptFile', async () => {
+  const request = await C.generateRequestKey();
+  if (request.privateKey.extractable) throw new Error('the request private key is extractable');
+  const plaintext = randomBytes(65519 + 11);
+  const { fragment, blob } = await C.encryptFile(plaintext, {
+    name: 'for you.txt', type: 'text/plain', recipient: request.publicKey, expiresAt: 1790000000, maxDownloads: 1 });
+  eq(fragment, null, 'fragment');
+  const bytes = await bytesOf(blob);
+  eq(bytes[1], 0, 'flags');
+  eq(bytes[558], 1, 'entry_count');
+  eq(bytes.subarray(559, 562), new Uint8Array([0x02, 0x00, 0x5c]), 'type and length');
+  const preview = C.parseHeader(bytes.subarray(0, 8192));
+  eq(preview.headerLength, 558 + 1 + 95, 'header length');
+  const other = await C.generateRequestKey();
+  const { fileKey, requestKey } = await C.unlockRequest(preview, [other, request]);
+  if (requestKey !== request) throw new Error('the wrong request key was reported');
+  const { metadata, plaintext: out } = await C.decryptFile(fileKey, preview, bytes);
+  eq(metadata.name, 'for you.txt', 'name');
+  sameBytes(out, plaintext, 'plaintext');
+  ne(bytes.subarray(562, 594), (await bytesOf((await C.encryptFile(plaintext, {
+    name: 'a', type: '', recipient: request.publicKey, expiresAt: 1790000000, maxDownloads: 1 })).blob)).subarray(562, 594),
+    'ephemeral keys of two uploads');
+  await rejects(() => C.encryptFile(plaintext, { name: 'a', type: '', recipient: request.publicKey, passphrase: 'x', expiresAt: 1790000000, maxDownloads: 1 }),
+    'a request upload with a passphrase');
+});
+
+test('0x02 must fail: wrong private key, entry moved to another salt, tampered ephemeral_pk, iv, ciphertext or tag', async () => {
+  const key = await katRequestKey();
+  const entry = unhex(KAT.entryRecipient);
+  const other = await C.generateRequestKey();
+  await rejects(() => C.unlockRequest(withSlot(KAT.salt, entry), [other]), 'wrong private key', 'other-browser');
+  await rejects(() => C.unlockRequest(withSlot(KAT.salt, entry), []), 'no request keys at all', 'other-browser');
+  await rejects(() => C.unlockRequest(withSlot(C.generateSalt(), entry), [key]), 'entry moved to a file with another salt', 'other-browser');
+  // The right private key, wrong public key in the info: the binding is checked.
+  await rejects(() => C.unlockRequest(withSlot(KAT.salt, entry), [{ privateKey: key.privateKey, publicKey: other.publicKey }]),
+    'right private key, another public key', 'other-browser');
+  for (const [why, i] of [['ephemeral_pk', 3], ['ephemeral_pk last byte', 34], ['iv', 40], ['wrapped_key', 60], ['tag', 94]]) {
+    const t = entry.slice(); t[i] ^= 0x01;
+    await rejects(() => C.unlockRequest(withSlot(KAT.salt, t), [key]), `flipped ${why} byte`, 'other-browser');
+  }
+  const relabeled = entry.slice(); relabeled[0] = 0x01;
+  await rejects(() => C.unlockRequest(withSlot(KAT.salt, relabeled), [key]), 'relabeled to 0x01', 'no-fragment');
+  const short = entry.slice(0, 94); short[2] = 91;
+  await rejects(() => C.unlockRequest(withSlot(KAT.salt, short), [key]), '0x02 entry with body length 91', 'other-browser');
+});
+
+test('0x02 must fail: a low-order ephemeral_pk in an entry, and a low-order recipient key at upload', async () => {
+  const key = await katRequestKey();
+  for (const point of KAT.lowOrder) {
+    const t = unhex(KAT.entryRecipient); t.set(unhex(point), 3);
+    await rejects(() => C.unlockRequest(withSlot(KAT.salt, t), [key]), `ephemeral_pk ${point.slice(0, 8)}…`, 'other-browser');
+    await rejects(() => C.wrapForRecipient(unhex(point), KAT.fileKey, KAT.salt), `wrap to ${point.slice(0, 8)}…`, 'low-order');
+    await rejects(() => C.encryptFile(new Uint8Array(1), { name: 'a', type: '', recipient: unhex(point), expiresAt: 1790000000, maxDownloads: 1 }),
+      `upload to ${point.slice(0, 8)}…`, 'low-order');
+  }
+});
+
+test('slot (§5): a 0x02 entry after a junk 0x02 and an unknown type still opens; a 0x01 alongside is skipped', async () => {
+  const key = await katRequestKey();
+  const fragmentEntry = await C.wrapFileKey(await publicWrappingKey(C.generateFragmentSecret(), KAT.salt), KAT.fileKey);
+  const preview = withSlot(KAT.salt, entryOf(0x02, 92), entryOf(0x7f, 4), fragmentEntry, unhex(KAT.entryRecipient));
+  eq((await C.unlockRequest(preview, [key])).fileKey, KAT.fileKey, 'file_key');
+  await rejects(() => C.unlockRequest(withSlot(KAT.salt, entryOf(0x7f, 4)), [key]), 'only unknown types', 'needs-newer-version');
+  await rejects(() => C.unlockRequest(withSlot(KAT.salt, fragmentEntry), [key]), 'only a 0x01 entry', 'no-fragment');
+});
+
+test('request link (§2.1): malformed keys rejected with a reason, never decoded', async () => {
+  const bad = {
+    '42 characters': KAT.requestKey.slice(0, 42),
+    '44 characters': KAT.requestKey + 'A',
+    'empty': '',
+    'padded': KAT.requestKey + '=',
+    'standard base64 alphabet': '+' + KAT.requestKey.slice(1),
+    'trailing bits not zero': KAT.requestKey.slice(0, 42) + 'x',
+    'high bit set (non-canonical)': C.encodeRequestKey(Uint8Array.from(unhex(KAT.recipientPub), (b, i) => (i === 31 ? b | 0x80 : b))),
+    'u = p (non-canonical)': C.encodeRequestKey(unhex('edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f')),
+  };
+  for (const point of KAT.lowOrder) bad[`low-order ${point.slice(0, 8)}…`] = C.encodeRequestKey(unhex(point));
+  for (const [why, text] of Object.entries(bad)) {
+    const err = await rejects(() => C.decodeRequestKey(text), why, 'request-link');
+    if (!/^This request link is damaged: /.test(err.message)) throw new Error(`${why}: message ${err.message}`);
+  }
+  eq(await C.decodeRequestKey(KAT.requestKey), unhex(KAT.recipientPub), 'the good key still decodes');
+});
+
+test('fingerprint (§2.1): 12 Crockford base32 characters in three groups of four; differs per key', async () => {
+  const a = await C.requestFingerprint((await C.generateRequestKey()).publicKey);
+  const b = await C.requestFingerprint((await C.generateRequestKey()).publicKey);
+  if (!/^[0-9A-HJKMNP-TV-Z]{4} [0-9A-HJKMNP-TV-Z]{4} [0-9A-HJKMNP-TV-Z]{4}$/.test(a)) throw new Error(`fingerprint ${a}`);
+  ne(new TextEncoder().encode(a), new TextEncoder().encode(b), 'two fingerprints');
 });
 
 // ---- §3.1 parseHeader -----------------------------------------------------

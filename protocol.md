@@ -19,6 +19,13 @@ Step 06 wrote down what every JSON parser in use already did with a duplicated
 metadata key — the last occurrence wins (§7, §11) — and that an upload carries
 `expires_at` and `max_downloads` as request parameters beside the blob (§10).
 No byte of the format changed.
+Step 07 defined type `0x02`, which until then was only reserved: it mirrors
+`0x01` and differs only in where the wrapping key comes from, an X25519
+exchange (§5). It also added request links, their fingerprint, and the link
+with no fragment that a file sent to a request gets (§2, §10). No existing byte
+changed: every `0x01` entry, every header and every link already shared reads
+exactly as before, and the version stays 1 because the slot extends within a
+version (§9).
 Before any link existed, the HKDF info strings (§4.3) were renamed from the
 project's earlier name to `sunbird/v1/...`, and the §5 and §9 messages with
 them. That changes every derived key, but no link had ever been shared, so no
@@ -71,6 +78,51 @@ bits are rejected (§3.1). Of the 64 possible 22nd characters, exactly four
 
 base64url rather than base58: links are pasted, not hand-copied, so avoiding
 ambiguous glyphs buys nothing and costs a dependency.
+
+### 2.1 Request links
+
+```
+https://<host>/r#<request_key>     made by the recipient
+https://<host>/d/<id>              sent back by the sender, with no fragment
+```
+
+A recipient who wants a file without any link carrying a secret makes a
+request. Their browser generates an X25519 key pair and keeps the private key;
+the public key, `request_key`, goes in the request link as base64url without
+padding. The sender wraps `file_key` to it in a type `0x02` entry (§5) and
+gets back a link with no fragment.
+
+A request key MUST be exactly 43 characters from the base64url alphabet, with
+no padding, and the trailing two bits of the 43rd character MUST be zero. It
+MUST decode to a canonical X25519 public key: read little-endian, its value is
+below 2^255 − 19, so in particular the top bit of the last byte is zero. It
+MUST NOT be of low order. A client checks that by running X25519 with a fresh
+key pair of its own: an all-zero result, or the browser refusing to import or
+use the key, means low order. A client MUST NOT emit, and MUST reject, any
+other request key, for the same reason as the fragment: one key, one spelling,
+and nothing else carried.
+
+**Fingerprint.**
+
+```
+fingerprint = first 60 bits of SHA-256("sunbird/v1/fingerprint" ‖ request_key)
+```
+
+`request_key` here is the 32 decoded bytes. The 60 bits are written as 12
+characters of Crockford base32 (`0123456789ABCDEFGHJKMNPQRSTVWXYZ`), most
+significant bits first, in three groups of four separated by a space: for
+example `AME4 XQ7P V4QQ`. The recipient's page and the sender's page both show
+it, and the sender checks the two match over some channel other than the one
+the link came by. Someone who changes the link on the way can put in their own
+key, and the check is what catches it: to pass, they need a key whose
+fingerprint matches one they did not choose, about 2^60 tries. A sender who
+skips the check is trusting every route the link took.
+
+**A link with no fragment.** `/d/<id>` with nothing after it, or with an
+empty `#`, is the link a file sent to a request gets. It is not a malformed
+fragment, and the rules above for fragments do not apply to it. The client
+fetches the preview and tries the request keys it holds (§10). Like the
+fragment, the request key enters the cryptography as bytes; the URL does not.
 
 **The URL never enters the cryptography.** Not the host, not the path, not the
 ID — only the decoded fragment bytes. Send salts its KDF with the full share
@@ -228,11 +280,12 @@ metadata_iv    = HKDF(file_key, "sunbird/v1/metadata-nonce", 12)
 
 Info strings are ASCII, no terminator. Every info string names the version, so
 a version bump changes every derived key — a second defence behind the version
-byte in AAD.
+byte in AAD. The `0x02` wrapping key appends two public keys to its info
+string (§5).
 
 Everything except `wrapping_key` hangs off `file_key`, not off the
-passphrase-derived key. That is what lets a future recipient who unwraps
-`file_key` another way (§5, type `0x02`) read both content and metadata.
+passphrase-derived key. That is what lets a recipient who unwraps `file_key`
+another way (§5, type `0x02`) read both content and metadata.
 
 The HKDF salt is the header salt, **not** the file ID: the ID does not exist
 until upload finishes, and binding crypto to a server-chosen identifier is the
@@ -243,7 +296,9 @@ class of mistake behind Send's host problem.
 ## 5. Key-wrapping slot (D3)
 
 The content is encrypted under a random `file_key`, which is *wrapped* into
-the slot rather than derived. v1 writes exactly one entry. The slot exists so
+the slot rather than derived. An upload writes exactly one entry: type `0x01`
+for a link with a fragment, or type `0x02` for a file sent to a request link
+(§2.1). The slot exists so
 that v2 can add per-recipient entries next to it without a format change —
 wrapping can emulate derivation, but not the reverse.
 
@@ -276,16 +331,47 @@ AES-GCM rather than AES-KW: it is already in the stack, it is AEAD so the entry
 type can be bound (a server cannot relabel an entry), and it avoids WebCrypto's
 extractable-key handling for AES-KW.
 
-### Type `0x02` — X25519 recipient (reserved; not implemented in v1; body 92)
+### Type `0x02` — X25519 recipient (body 92 bytes)
+
+Used for a file sent to a request link (§2.1). The body mirrors `0x01`
+exactly, with the ephemeral public key in front. Only the wrapping key
+differs: it comes from an X25519 exchange with the recipient's request key,
+not from the fragment.
 
 ```
-ephemeral_pk  32
-iv            12
-wrapped_key   32
+ephemeral_pk  32   X25519 public key, fresh per entry
+iv            12   random
+wrapped_key   32   AES-256-GCM(recipient_wrapping_key, iv, file_key, AAD)
 tag           16
+AAD           = version ‖ type           (2 bytes: 0x01 0x02)
 ```
 
-A v1 client never writes this type and skips it when reading.
+```
+sender:     shared = X25519(ephemeral_sk, recipient_pk)
+recipient:  shared = X25519(recipient_sk, ephemeral_pk)
+recipient_wrapping_key = HKDF(shared, "sunbird/v1/wrap-x25519" ‖ ephemeral_pk ‖ recipient_pk, 32)
+```
+
+`HKDF` is as in §4.3, with the header `salt` as HKDF salt. `recipient_pk` is
+the 32 bytes of the request key, and the info string is the ASCII label
+followed by the two public keys, 86 bytes in all.
+
+- **An all-zero `shared` is refused.** It means a low-order key. The sender
+  MUST NOT write the entry; the recipient treats it as an entry that failed to
+  unwrap.
+- **A fresh ephemeral key pair per entry.** Its private key is used once to
+  wrap and then discarded, never stored or exported.
+- **What binds what.** The salt ties the entry to this file, so an entry moved
+  to another file does not unwrap, as for `0x01`. The info string ties it to
+  both public keys, so changing `ephemeral_pk` changes the wrapping key. The
+  AAD is built as for `0x01`, `version ‖ type`, so the server cannot relabel
+  the entry as another type.
+- **No recipient identifier, on purpose.** The blob does not say whom it is
+  for. A client tries every request key it holds against every `0x02` entry.
+- **No passphrase.** `flags` bit 0 does not enter a `0x02` entry. An upload
+  whose only entry is `0x02` sets `flags` to 0 and offers no passphrase.
+- **A `0x02` entry whose `length` is not 92** is treated as an entry that
+  failed to unwrap, by the same reasoning as for `0x01` below.
 
 ### Unwrapping
 
@@ -293,8 +379,13 @@ A client MUST try **every** entry of a known type, in slot order, continuing
 past any entry that fails to unwrap. It uses the `file_key` from the first
 entry that unwraps, and reports failure only when every entry is exhausted:
 
-- if at least one `0x01` entry was tried and none unwrapped, report a wrong
-  passphrase or damaged link;
+- if at least one `0x01` entry was tried with a fragment and none unwrapped,
+  report a wrong passphrase or damaged link;
+- otherwise, if there is a `0x02` entry and none unwrapped with any request
+  key the client holds, report: *"This file was sent to a request made in
+  another browser. Open the link there."*;
+- otherwise, if there is a `0x01` entry but the link had no fragment, report
+  that the link is incomplete;
 - if no entry has a known type, report: *"This link needs a newer version of
   Sunbird."* — the file was not shared in a way this client can read.
 
@@ -313,9 +404,9 @@ past the end of the header is still malformed (§3.1).
 Stopping at the first failure is wrong. The slot is not covered by record AAD
 (below), so an entry that fails says nothing about the entries after it: a
 damaged or junk entry can sit in front of a good one. And the rule must hold
-for types defined later. A v2 client that knows `0x02` may meet several `0x02`
-entries, of which only one is its own. This is about future types, not `0x01`:
-a file has exactly one legitimate `0x01` entry (above).
+for types defined later. A client that knows `0x02` may meet several `0x02`
+entries, of which only one is its own. This is about `0x02` and later types,
+not `0x01`: a file has exactly one legitimate `0x01` entry (above).
 
 ### The slot is not covered by record AAD
 
@@ -565,13 +656,16 @@ entry to an existing file (§5).
    the passphrase flag is set, reject an empty passphrase.
 3. Derive `ikm` (Argon2id only if a passphrase is set), then every key in §4.3.
 4. Build and encrypt metadata (§7) → `metadata_ct`.
-5. Wrap `file_key` into one `0x01` entry → slot.
+5. Wrap `file_key` into one `0x01` entry → slot. For a request link, wrap it
+   into one `0x02` entry instead (§5); steps 1 and 3 then make no
+   `fragment_secret`, `ikm` or `wrapping_key`, and `flags` is 0.
 6. `header_core = header_prefix ‖ metadata_ct`; compute `SHA-256(header_core)`.
    `header = header_core ‖ slot`.
 7. Encrypt records (§6); upload `header ‖ records` as the body of
    `POST /api/upload?expires_at=<decimal>&max_downloads=<decimal>`. The two
    parameters MUST be identical to the values in `header_prefix`.
-8. Server returns `id`; client shows `https://<host>/d/<id>#<fragment>`.
+8. Server returns `id`; client shows `https://<host>/d/<id>#<fragment>`, or
+   for a request link `https://<host>/d/<id>` with no fragment.
 
 The server cannot read the limits out of the blob, because it keeps no format
 knowledge (§3); that is why they travel twice. The server's copy is
@@ -600,6 +694,28 @@ user, not a limit — the server's bound is unchanged.
 6. Fetch the blob; check its `header_core` matches the preview; decode records
    and verify `size` (§6.5).
 
+### Request
+
+Making one:
+
+1. Generate an X25519 key pair. The private key is non-extractable.
+2. Keep the private key, `request_key`, the fingerprint and the times in the
+   browser (`DECISIONS.md` D11). It expires 7 days after it was made.
+3. Show `https://<host>/r#<request_key>` and the fingerprint (§2.1).
+
+Sending to one: decode the request key strictly (§2.1) and show its
+fingerprint. Then upload as above with one `0x02` entry, and show the link
+with no fragment.
+
+Downloading a link with no fragment:
+
+1. Fetch the preview and parse the header, as download steps 1 and 2.
+2. Try every request key held against every `0x02` entry (§5). If none
+   unwraps, report it and stop. The blob is not fetched, so no download is
+   used up.
+3. Download steps 5 and 6.
+4. Once the file has decrypted and verified, delete the request key.
+
 ---
 
 ## 11. Decoder rules at a glance
@@ -610,11 +726,15 @@ only the uploader writes.
 | Input | Behaviour |
 |---|---|
 | Fragment not exactly 22 base64url chars; trailing 4 bits non-zero | Reject |
+| Request key not exactly 43 base64url chars; trailing 2 bits non-zero; not canonical; low order | Reject |
+| No fragment, and no request key held unwraps a `0x02` entry | Report; do not fetch the blob |
 | Unknown `version` | Reject with the update message (§9) |
 | Reserved `flags` bits set | Reject |
 | `entry_count` 0 or > 64; header > 8 KiB; entry past end of blob | Reject |
 | Unknown slot entry type | Skip by `length` |
 | `0x01` entry with `length` ≠ 60 | Failed unwrap; continue to the next entry |
+| `0x02` entry with `length` ≠ 92, or an all-zero X25519 output | Failed unwrap; continue to the next entry |
+| All-zero X25519 output at upload | Refuse to write the entry |
 | Downloaded `header_core` ≠ previewed | Reject |
 | Empty body; > 1601 records; last record < 17 bytes | Reject before decrypting |
 | Any AEAD failure | Reject the whole file |

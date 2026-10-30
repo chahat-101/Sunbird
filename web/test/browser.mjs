@@ -82,9 +82,12 @@ export function findBrowser(browser) {
   throw new Error(`no ${browser} found. Looked for: ${looked.join('; ')}.${install}`);
 }
 
-// Returns { navigate, evaluate, preload, viewport, close }. preload runs in
-// every later page before its scripts. viewport(w, h) emulates a phone at
-// 3× DPR; viewport(null) resets.
+// Returns { navigate, evaluate, preload, viewport, newContext, close }.
+// preload runs in every later page before its scripts. viewport(w, h)
+// emulates a phone at 3× DPR; viewport(null) resets. newContext() opens a page
+// in a separate browser context, with its own storage, and returns
+// { navigate, evaluate, viewport, close }. close() brings the first page back
+// to the front, where its timers run at full speed.
 export async function launch(browser) {
   if (browser !== 'firefox' && browser !== 'chromium') throw new Error(`unknown browser ${browser}`);
   const binary = findBrowser(browser);
@@ -146,10 +149,8 @@ function connect(url) {
 async function firefoxPage(send) {
   await send('session.new', { capabilities: {} });
   const { contexts } = await send('browsingContext.getTree', {});
-  const context = contexts[0].context;
-  return {
+  const page = (context) => ({
     navigate: (url) => send('browsingContext.navigate', { context, url, wait: 'complete' }),
-    preload: (fn) => send('script.addPreloadScript', { functionDeclaration: fn }),
     viewport: (width, height) => send('browsingContext.setViewport', width
       ? { context, viewport: { width, height }, devicePixelRatio: 3 }
       : { context, viewport: null, devicePixelRatio: null }),
@@ -158,22 +159,66 @@ async function firefoxPage(send) {
       if (r.type === 'exception') throw new Error(r.exceptionDetails.text);
       return r.result.value;
     },
+  });
+  const main = contexts[0].context;
+  return {
+    ...page(main),
+    // With no contexts named, a preload script runs in every user context.
+    preload: (fn) => send('script.addPreloadScript', { functionDeclaration: fn }),
+    newContext: async () => {
+      const { userContext } = await send('browser.createUserContext', {});
+      const { context } = await send('browsingContext.create', { type: 'tab', userContext, background: true });
+      return {
+        ...page(context),
+        close: async () => {
+          await send('browsingContext.close', { context });
+          await send('browser.removeUserContext', { userContext });
+          await send('browsingContext.activate', { context: main });
+        },
+      };
+    },
   };
 }
 
 async function chromiumPage(send) {
-  const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
+  const preloads = [];
+  const main = await chromiumTarget(send, undefined, preloads);
+  return {
+    ...main,
+    preload: async (fn) => {
+      preloads.push(fn);
+      await send('Page.addScriptToEvaluateOnNewDocument', { source: `(${fn})();` }, main.sessionId);
+    },
+    newContext: async () => {
+      const { browserContextId } = await send('Target.createBrowserContext', {});
+      const { navigate, evaluate, viewport, targetId } = await chromiumTarget(send, browserContextId, preloads);
+      return {
+        navigate, evaluate, viewport,
+        close: async () => {
+          await send('Target.closeTarget', { targetId });
+          await send('Target.disposeBrowserContext', { browserContextId });
+          await send('Target.activateTarget', { targetId: main.targetId });
+        },
+      };
+    },
+  };
+}
+
+async function chromiumTarget(send, browserContextId, preloads) {
+  const { targetId } = await send('Target.createTarget', { url: 'about:blank', ...(browserContextId && { browserContextId }) });
   const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
   // Without it, scripts added by preload are accepted and never run.
   await send('Page.enable', {}, sessionId);
+  for (const fn of preloads) await send('Page.addScriptToEvaluateOnNewDocument', { source: `(${fn})();` }, sessionId);
   const evaluate = async (expression) => {
     const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
     return r.result.value;
   };
   return {
+    targetId,
+    sessionId,
     evaluate,
-    preload: (fn) => send('Page.addScriptToEvaluateOnNewDocument', { source: `(${fn})();` }, sessionId),
     viewport: async (width, height) => {
       if (!width) {
         await send('Emulation.clearDeviceMetricsOverride', {}, sessionId);

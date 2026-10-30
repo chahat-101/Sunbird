@@ -1,6 +1,7 @@
 // End-to-end tests: build the server, run it on an empty data directory, and
 // drive the real page in a headless browser. Covers upload, open, download,
-// and what a hostile server can do by editing blobs on disk.
+// request links across separate browser contexts, and what a hostile server
+// can do by editing blobs on disk.
 //
 //   node web/test/e2e.mjs [firefox|chromium] [--phone]
 //
@@ -35,6 +36,9 @@ const KAT_PW_KEY = 'c5149c70ce74d0f923b88f8e36ece0c580fe7a12b3575728dbf804174fdd
 // Tokens as `sunbird mint-token` makes them; only their hashes go in the config.
 const TOKEN = randomBytes(16).toString('base64url');
 const SMALL_TOKEN = randomBytes(16).toString('base64url'); // a member with a 2000-byte quota
+const ADMIN_TOKEN = randomBytes(16).toString('base64url'); // reads /admin/stats
+const OTHER_BROWSER = 'This file was sent to a request made in another browser. Open the link there.';
+const SIGN_IN_TO_SEND = 'You need to sign in to send a file. Use “Sign in with Google” on this page, then open this request link again. If this server has no sign-in, ask its admin for access.';
 const GOOGLE_CLIENT_ID = 'e2e-client.apps.googleusercontent.com';
 const GOOGLE_CLIENT_SECRET = randomBytes(12).toString('hex');
 const BAD_TOKEN = 'The server did not accept this upload token. Check it, or ask the admin whether it is still valid.';
@@ -261,6 +265,36 @@ const details = () => inPage(() => ({
   pwned: window.__pwned === 1,
 }));
 
+// Polls fn (in Node) until it returns something truthy.
+async function waitFor(fn, what, timeout = 30_000) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const value = await fn();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await sleep(50);
+  }
+}
+
+// Runs fn with the page helpers pointed at another browser context.
+async function within(page, fn) {
+  const main = b;
+  b = page;
+  try {
+    return await fn();
+  } finally {
+    b = main;
+  }
+}
+// Closed by the runner after each test.
+const contexts = [];
+async function freshContext() {
+  const page = await b.newContext();
+  contexts.push(page);
+  if (phone) await page.viewport(...PHONE);
+  return page;
+}
+
 async function clickDownload() {
   await inPage(() => { document.getElementById('download-button').click(); });
   return waitState('download-status', ['done', 'error']);
@@ -272,13 +306,14 @@ const test = (name, fn) => tests.push({ name, fn });
 test('server: serves the client with its CSP at / and /d/<id>, and nothing else from web/', async () => {
   // The page is embedded: the server runs in a directory with no web/ beside it.
   ok(!existsSync(join(work, 'web')), 'the server\'s working directory has a web/');
-  for (const path of ['/', '/d/AAAAAAAAAAAAAAAA']) {
+  for (const path of ['/', '/r', '/d/AAAAAAAAAAAAAAAA']) {
     const r = await fetch(base + path);
     eq(r.status, 200, `${path} status`);
     ok(r.headers.get('content-type').startsWith('text/html'), `${path} content type`);
     ok(r.headers.get('content-security-policy').includes("script-src 'self' 'wasm-unsafe-eval'"), `${path} CSP`);
   }
-  for (const path of ['/app.css', '/src/app.js', '/src/crypto.js', '/src/argon2.js', '/src/argon2-worker.js', '/vendor/hash-wasm/argon2.umd.min.js']) {
+  for (const path of ['/app.css', '/src/app.js', '/src/crypto.js', '/src/theme.js', '/src/dither.js', '/src/argon2.js', '/src/argon2-worker.js',
+    '/vendor/hash-wasm/argon2.umd.min.js', '/assets/schibsted-grotesk.woff2', '/assets/jetbrains-mono.woff2']) {
     const r = await fetch(base + path);
     eq(r.status, 200, `${path} status`);
     // A Worker takes its policy from its own response, not from the page.
@@ -759,6 +794,252 @@ test('bad links: no such file; damaged fragment', async () => {
   ok(/^This link is damaged or incomplete\./.test((await readStatus('download-status')).text), 'short fragment');
 });
 
+// ---- request links (§2.1, §5 type 0x02) -------------------------------------
+
+const downloadCount = async () => (await (await fetch(`${base}/admin/stats`, {
+  headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+})).json()).downloads;
+
+// Reads the page's request store without creating it.
+const storedRequests = () => inPage(async () => {
+  if (!(await indexedDB.databases()).some((d) => d.name === 'sunbird')) return null;
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('sunbird');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const all = db.transaction('requests').objectStore('requests').getAll();
+      all.onsuccess = () => {
+        db.close();
+        resolve(all.result.map((r) => ({
+          id: r.id, fingerprint: r.fingerprint, extractable: r.privateKey && r.privateKey.extractable,
+          isKey: r.privateKey instanceof CryptoKey, lifetime: r.expiresAt - r.createdAt,
+        })));
+      };
+      all.onerror = () => reject(all.error);
+    };
+  });
+});
+
+async function makeRequest() {
+  await go(`${base}/r`);
+  await inPage(() => { document.getElementById('request-button').click(); });
+  const status = await waitState('request-status', ['done', 'error']);
+  return {
+    status,
+    link: await inPage(() => document.getElementById('request-link').value),
+    fingerprint: await inPage(() => document.getElementById('request-fingerprint').textContent),
+  };
+}
+
+// Opens a request link and waits until it has decoded, or failed to.
+async function openRequestLink(link) {
+  await go(`${base}/`);
+  await go(link);
+  await waitFor(() => inPage(() => document.getElementById('sender-fingerprint').textContent !== '' ||
+    document.getElementById('upload-status').dataset.state === 'error'), `${link} to decode`);
+  return inPage(() => ({
+    fingerprint: document.getElementById('sender-fingerprint').textContent,
+    status: { state: document.getElementById('upload-status').dataset.state, text: document.getElementById('upload-status').textContent },
+    buttonDisabled: document.getElementById('upload-button').disabled,
+    button: document.getElementById('upload-button').textContent.replace(/\s+/g, ' '),
+    shown: ['who', 'request-for', 'request-offer', 'protect', 'passphrase'].filter((id) => document.getElementById(id).getClientRects().length > 0),
+  }));
+}
+
+async function sendToRequest(link, { size, seed, check = true, token = TOKEN }) {
+  const opened = await openRequestLink(link);
+  await inPage((token, size, seed, check) => {
+    document.getElementById('upload-token').value = token;
+    T.setFile('asked for.bin', 'application/octet-stream', size, seed);
+    document.getElementById('fingerprint-checked').checked = check;
+    document.getElementById('upload-button').click();
+  }, token, size, seed, check);
+  const status = await waitState('upload-status', ['done', 'error']);
+  const result = await inPage(() => ({
+    link: document.getElementById('link').value,
+    shown: ['link-public', 'link-restricted', 'link-request', 'link-key-note'].filter((id) => !document.getElementById(id).hidden),
+    uploads: T.uploads(),
+  }));
+  return { opened, status, ...result };
+}
+
+test('request link: recipient asks, sender uploads, a third browser is turned away with no download used, recipient gets the bytes and the key goes', async () => {
+  const recipient = await freshContext();
+  const sender = await freshContext();
+  const stranger = await freshContext();
+  const size = 2 * 65519 + 77;
+
+  const asked = await within(recipient, makeRequest);
+  eq(asked.status.state, 'done', `request: ${asked.status.text}`);
+  ok(new RegExp(`^${base}/r#[A-Za-z0-9_-]{43}$`).test(asked.link), `request link ${asked.link}`);
+  ok(/^[0-9A-HJKMNP-TV-Z]{4} [0-9A-HJKMNP-TV-Z]{4} [0-9A-HJKMNP-TV-Z]{4}$/.test(asked.fingerprint), `fingerprint ${asked.fingerprint}`);
+  const kept = await within(recipient, storedRequests);
+  eq(kept.length, 1, 'requests stored');
+  eq(kept[0].fingerprint, asked.fingerprint, 'stored fingerprint');
+  ok(kept[0].isKey && kept[0].extractable === false, 'the stored private key is not a non-extractable CryptoKey');
+  eq(kept[0].lifetime, 7 * 24 * 3600 * 1000, 'request lifetime');
+
+  const sent = await within(sender, () => sendToRequest(asked.link, { size, seed: 31 }));
+  eq(sent.opened.fingerprint, asked.fingerprint, 'fingerprint on both sides');
+  eq(JSON.stringify(sent.opened.shown), '["request-for"]', 'sender: shown (no passphrase option)');
+  ok(/for this request/.test(sent.opened.button), `sender: button reads ${sent.opened.button}`);
+  eq(sent.status.state, 'done', `upload: ${sent.status.text}`);
+  ok(new RegExp(`^${base}/d/[A-Za-z0-9_-]{16}$`).test(sent.link), `the link has a fragment or is malformed: ${sent.link}`);
+  eq(JSON.stringify(sent.shown), '["link-request"]', 'sender: link explanation shown');
+  eq(await within(sender, storedRequests), null, 'the sender\'s browser stored a request');
+
+  const id = idOf(sent.link);
+  const stored = readFileSync(blobPath(id));
+  eq(stored[0], 1, 'stored version');
+  eq(stored[1], 0, 'stored flags');
+  eq(`${stored[558]} ${stored[559]} ${stored.readUInt16BE(560)}`, '1 2 92', 'slot: one 0x02 entry of 92 bytes');
+  eq(stored.length, 558 + 1 + 95 + 2 * 65536 + 77 + 17, 'blob length');
+  ok(!stored.includes(Buffer.from(asked.link.split('#')[1], 'base64url')), 'the recipient key is in the blob');
+
+  const before = await downloadCount();
+  await within(stranger, async () => {
+    await go(sent.link);
+    const status = await waitState('download-status', ['ready', 'error']);
+    eq(status.state, 'error', 'stranger: state');
+    eq(status.text, OTHER_BROWSER, 'stranger: message');
+    eq(JSON.stringify((await probed()).requests.map((r) => r.replace(id, '<id>'))), '["GET /api/meta/<id>"]', 'stranger: requests');
+    eq(JSON.stringify(await shownIds('details', 'download-request', 'download-public', 'download-restricted', 'unlock')), '[]', 'stranger: shown');
+    eq(await storedRequests(), null, 'stranger: a request database was created');
+  });
+  eq(await downloadCount(), before, 'downloads counted after the stranger');
+  ok(existsSync(blobPath(id)), 'the blob went after the stranger opened the link');
+
+  await within(recipient, async () => {
+    await go(sent.link);
+    const status = await waitState('download-status', ['ready', 'error']);
+    eq(status.state, 'ready', `recipient: ${status.text}`);
+    eq(JSON.stringify(await shownIds('download-request', 'download-public', 'download-restricted', 'unlock')), '["download-request"]', 'recipient: shown');
+    eq((await details()).name, 'asked for.bin', 'recipient: name');
+    eq(JSON.stringify((await probed()).requests.map((r) => r.replace(id, '<id>'))), '["GET /api/meta/<id>"]', 'recipient: requests before Download');
+    const done = await clickDownload();
+    eq(done.state, 'done', `recipient download: ${done.text}`);
+    ok(/its key was deleted from this browser/.test(done.text), `recipient: ${done.text}`);
+    const saved = await inPage(() => T.saved());
+    eq(saved.length, 1, 'recipient: files saved');
+    eq(saved[0].sha256, sha256(pattern(size, 31)), 'recipient: saved bytes');
+    eq(JSON.stringify(await storedRequests()), '[]', 'recipient: request keys left');
+    await go(`${base}/r`);
+    await waitFor(() => inPage(() => !document.getElementById('requests-empty').hidden), 'the empty request list');
+  });
+  await waitFor(async () => (await downloadCount()) === before + 1, 'the recipient\'s download to be counted');
+});
+
+test('request link: the sender must tick that the fingerprint matches; a passphrase box restored ticked is ignored', async () => {
+  const recipient = await freshContext();
+  const asked = await within(recipient, makeRequest);
+  const sent = await sendToRequest(asked.link, { size: 100, seed: 1, check: false });
+  eq(sent.status.state, 'error', 'unticked: state');
+  ok(/Check the fingerprint/.test(sent.status.text), `unticked: ${sent.status.text}`);
+  eq(sent.uploads, 0, 'unticked: uploads');
+
+  // ?restored-ticked makes the probe tick the passphrase box before the page runs.
+  await go(`${base}/`);
+  await go(`${base}/r?restored-ticked${asked.link.slice(asked.link.indexOf('#'))}`);
+  await waitFor(() => inPage(() => document.getElementById('sender-fingerprint').textContent !== ''), 'the key to decode');
+  await inPage((token) => {
+    document.getElementById('upload-token').value = token;
+    T.setFile('r.txt', 'text/plain', 100, 2);
+    document.getElementById('fingerprint-checked').checked = true;
+    document.getElementById('upload-button').click();
+  }, TOKEN);
+  eq((await waitState('upload-status', ['done', 'error'])).state, 'done', 'restored-ticked upload');
+  eq((await probed()).argon2id, 0, 'Argon2id calls');
+  const stored = readFileSync(blobPath(idOf(await inPage(() => document.getElementById('link').value))));
+  eq(`${stored[1]} ${stored[559]}`, '0 2', 'flags and entry type');
+});
+
+test('request link: a sender with no token, or one the server refuses, is told to sign in, not about a token', async () => {
+  const asked = await within(await freshContext(), makeRequest);
+  const none = await sendToRequest(asked.link, { size: 100, seed: 3, token: '' });
+  eq(none.status.text, SIGN_IN_TO_SEND, 'no token: message');
+  eq(none.uploads, 0, 'no token: uploads');
+  const refused = await sendToRequest(asked.link, { size: 100, seed: 3, token: 'not-a-member-token' });
+  eq(refused.status.text, SIGN_IN_TO_SEND, 'refused token: message');
+  ok(!/token/i.test(refused.status.text), 'the message talks about a token');
+});
+
+test('request link: malformed links are refused with a clear reason, never guessed at; nothing uploaded', async () => {
+  const good = (await within(await freshContext(), makeRequest)).link.split('#')[1];
+  const key = Buffer.from(good, 'base64url');
+  const highBit = Buffer.from(key); highBit[31] |= 0x80;
+  const bad = {
+    '42 characters': good.slice(0, 42),
+    '44 characters': `${good}A`,
+    'trailing bits not zero': good.slice(0, 42) + (good[42] === 'B' ? 'C' : 'B'),
+    'standard base64 alphabet': `+${good.slice(1)}`,
+    'low-order point (u = 0)': 'A'.repeat(43),
+    'low-order point (u = 1)': Buffer.from([1, ...new Uint8Array(31)]).toString('base64url'),
+    'non-canonical (high bit set)': highBit.toString('base64url'),
+  };
+  for (const [why, text] of Object.entries(bad)) {
+    eq(text === good, false, `${why}: the same as the good key`);
+    const opened = await openRequestLink(`${base}/r#${text}`);
+    eq(opened.status.state, 'error', `${why}: state`);
+    ok(/^This request link is damaged: .+\. Ask the person who made it to send it again\.$/.test(opened.status.text), `${why}: ${opened.status.text}`);
+    ok(opened.buttonDisabled, `${why}: upload button enabled`);
+    eq(opened.fingerprint, '', `${why}: a fingerprint was shown`);
+  }
+  eq(await inPage(() => T.uploads()), 0, 'uploads');
+});
+
+test('request page: lists waiting requests with fingerprints; delete removes one; expired ones are purged on load; at most 20; says what a private window does', async () => {
+  const page = await freshContext();
+  await within(page, async () => {
+    const first = await makeRequest();
+    const second = await makeRequest();
+    const listed = () => inPage(() => Array.from(document.querySelectorAll('#requests li code'), (c) => c.textContent));
+    eq(JSON.stringify(await listed()), JSON.stringify([first.fingerprint, second.fingerprint]), 'listed');
+    const notes = await inPage(() => document.getElementById('request').textContent.replace(/\s+/g, ' '));
+    ok(/In a private window, the key is lost when the window closes/.test(notes), `private window note: ${notes}`);
+    ok(/Anyone who can use this browser profile can use that key/.test(notes), `profile note: ${notes}`);
+
+    await inPage(() => { document.querySelector('#requests li button').click(); });
+    await waitFor(async () => (await listed()).length === 1, 'the list after a delete');
+    eq(JSON.stringify(await listed()), JSON.stringify([second.fingerprint]), 'after delete');
+    eq((await storedRequests()).length, 1, 'stored after delete');
+
+    // Age the remaining request past its expiry; the next load purges it.
+    await inPage(() => new Promise((resolve) => {
+      const open = indexedDB.open('sunbird');
+      open.onsuccess = () => {
+        const store = open.result.transaction('requests', 'readwrite').objectStore('requests');
+        store.openCursor().onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (!cursor) return resolve();
+          cursor.update({ ...cursor.value, expiresAt: Date.now() - 1 });
+          cursor.continue();
+        };
+      };
+    }));
+    await go(`${base}/`);
+    await waitFor(async () => (await storedRequests()).length === 0, 'the expired request to be purged by the upload page');
+
+    for (let i = 0; i < 20; i++) eq((await makeRequest()).status.state, 'done', `request ${i + 1}`);
+    const over = await makeRequest();
+    eq(over.status.state, 'error', '21st request: state');
+    eq(over.status.text, 'This browser already has 20 requests waiting, the most it keeps. Delete one first.', '21st request: message');
+    eq((await storedRequests()).length, 20, 'stored');
+  });
+});
+
+test('request link: a fragmentless link to an ordinary file says the link is incomplete, without downloading', async () => {
+  const up = await uploadViaForm({ name: 'plain.txt', type: 'text/plain', size: 10, seed: 0 });
+  const bare = up.link.split('#')[0];
+  await go(bare);
+  eq((await waitState('download-status', ['ready', 'error'])).text,
+    'This link is incomplete: the part after # is missing. Ask the sender for the whole link.', 'message');
+  eq(JSON.stringify((await probed()).requests.map((r) => r.replace(idOf(up.link), '<id>'))), '["GET /api/meta/<id>"]', 'requests');
+  await go(`${base}/`);
+  await go(up.link);
+  eq((await waitState('download-status', ['ready', 'error'])).state, 'ready', 'the whole link still opens');
+});
+
 // ---- the UI step: workers, progress, drops, copying, errors, phones --------
 
 test('passphrase worker: the page runs Argon2id off its main thread, gives the known answer, and keeps running meanwhile', async () => {
@@ -1068,6 +1349,12 @@ test('phone (390×844): nothing scrolls sideways and every control is a 44 px ta
     const [opening] = await inPage(() => __probe.stretches);
     eq((await clickDownload()).state, 'done', 'download');
     problems.push(...await layout('downloaded'));
+
+    const asked = await makeRequest();
+    eq(asked.status.state, 'done', `request: ${asked.status.text}`);
+    problems.push(...await layout('request page: a request made and listed'));
+    await openRequestLink(asked.link);
+    problems.push(...await layout('sending to a request'));
     eq(problems.join('\n      '), '', 'layout problems');
     console.log(`      Argon2id in a 390×844 window, this machine's CPU: ${sealing.ms} ms sealing, ${opening.ms} ms opening; ` +
       `longest main-thread stall ${Math.max(sealing.longestPause, opening.longestPause)} ms`);
@@ -1108,6 +1395,7 @@ try {
   base = await startServer('data', {
     upload_rate: { requests: 10000, seconds: 60 },
     read_rate: { requests: 100000, seconds: 60 },
+    admins: [{ id: randomBytes(16).toString('base64url'), name: 'e2e-admin', token_sha256: tokenHash(ADMIN_TOKEN) }],
     members: [member('e2e', TOKEN), member('small', SMALL_TOKEN, { max_active_bytes: 2000, max_active_files: 10 })],
     google_signin: {
       client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
@@ -1127,6 +1415,7 @@ try {
       failed++;
       console.log(`FAIL  ${name}\n      ${err.message}`);
     }
+    for (const page of contexts.splice(0)) await page.close();
   }
   const where = `${browser}${phone ? ' (390×844)' : ''}`;
   console.log(`\n${where}: ${failed ? `${failed} of ${tests.length} tests failed` : `All ${tests.length} tests passed`}`);

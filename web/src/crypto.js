@@ -52,6 +52,16 @@
   const ENTRY_FRAGMENT_BODY_LEN = IV_LEN + FILE_KEY_LEN + TAG_LEN; // 60
   const ENTRY_FRAGMENT_LEN = 1 + 2 + ENTRY_FRAGMENT_BODY_LEN;       // 63
 
+  // §5, type 0x02: type u8 ‖ length u16 ‖ ephemeral_pk 32 ‖ iv 12 ‖ wrapped_key 32 ‖ tag 16
+  const ENTRY_RECIPIENT = 0x02;
+  const X25519_KEY_LEN = 32;
+  const ENTRY_RECIPIENT_BODY_LEN = X25519_KEY_LEN + IV_LEN + FILE_KEY_LEN + TAG_LEN; // 92
+  const ENTRY_RECIPIENT_LEN = 1 + 2 + ENTRY_RECIPIENT_BODY_LEN;                      // 95
+  const INFO_WRAP_X25519 = 'sunbird/v1/wrap-x25519';
+  const INFO_FINGERPRINT = 'sunbird/v1/fingerprint';
+  const REQUEST_KEY_CHARS = 43;
+  const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
   // §6.1, §6.4
   const RECORD_LEN = 65536;                       // rs: ciphertext bytes per record
   const RECORD_DATA_LEN = RECORD_LEN - TAG_LEN - 1; // 65519
@@ -77,12 +87,18 @@
     return crypto.getRandomValues(new Uint8Array(n));
   }
 
-  function concat(a, b) {
-    const out = new Uint8Array(a.length + b.length);
-    out.set(a, 0);
-    out.set(b, a.length);
+  function concat(...parts) {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.length;
+    }
     return out;
   }
+
+  const base64url = (bytes) => btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
   // ---- §2 Fragment ----------------------------------------------------------
 
@@ -101,8 +117,7 @@
   // base64url, no padding: 16 bytes → 22 characters, trailing 4 bits zero.
   function encodeFragment(secret) {
     requireBytes(secret, FRAGMENT_SECRET_LEN, 'fragment secret');
-    return btoa(String.fromCharCode(...secret))
-      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    return base64url(secret);
   }
 
   // §2: exactly 22 base64url characters with the last 4 bits zero. Re-encoding
@@ -161,12 +176,13 @@
 
   // ---- §4.3 HKDF ------------------------------------------------------------
 
-  // HKDF-SHA256 with the header salt as HKDF salt. Returns raw bytes.
+  // HKDF-SHA256 with the header salt as HKDF salt. `info` is a string or bytes.
+  // Returns raw bytes.
   async function hkdf(ikm, salt, info, length) {
     requireBytes(salt, SALT_LEN, 'salt');
     const baseKey = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
     const bits = await crypto.subtle.deriveBits(
-      { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode(info) },
+      { name: 'HKDF', hash: 'SHA-256', salt, info: typeof info === 'string' ? new TextEncoder().encode(info) : info },
       baseKey,
       length * 8,
     );
@@ -248,8 +264,11 @@
     return { entries, length: offset };
   }
 
-  // Returns file_key from the first entry that unwraps.
-  async function unwrapSlot(wrappingKey, slot) {
+  const OTHER_BROWSER = 'This file was sent to a request made in another browser. Open the link there.';
+
+  // `unwrap` maps an entry type to a function that unwraps one entry of it.
+  // Returns the result of the first entry that unwraps.
+  async function unwrapEntries(slot, unwrap) {
     if (!(slot instanceof Uint8Array)) throw new Error('slot must be a Uint8Array');
     if (slot.length > MAX_HEADER_LEN - HEADER_CORE_LEN) {
       throw failure('malformed', 'Header is larger than 8 KiB');
@@ -259,19 +278,161 @@
     const { entries, length } = frameSlot(slot);
     if (length !== slot.length) throw failure('malformed', 'Bytes follow the last slot entry');
 
-    // Try every known entry in order; skip unknown types by their length.
-    let triedKnown = false;
+    // Try every entry we hold a key for, in order; skip the rest by their length.
+    const seen = new Set();
     for (const entry of entries) {
-      if (entry[0] !== ENTRY_FRAGMENT) continue;
-      triedKnown = true;
+      seen.add(entry[0]);
+      if (!unwrap[entry[0]]) continue;
       try {
-        return await unwrapFileKey(wrappingKey, entry);
+        return await unwrap[entry[0]](entry);
       } catch (_) {
         // Keep going. Rejecting the whole slot gains nothing (§5).
       }
     }
-    if (triedKnown) throw failure('wrong-passphrase', 'Wrong passphrase or damaged link.');
+    if (unwrap[ENTRY_FRAGMENT] && seen.has(ENTRY_FRAGMENT)) {
+      throw failure('wrong-passphrase', 'Wrong passphrase or damaged link.');
+    }
+    if (seen.has(ENTRY_RECIPIENT)) throw failure('other-browser', OTHER_BROWSER);
+    if (seen.has(ENTRY_FRAGMENT)) {
+      throw failure('no-fragment', 'This link is incomplete: the part after # is missing. Ask the sender for the whole link.');
+    }
     throw failure('needs-newer-version', 'This link needs a newer version of Sunbird.');
+  }
+
+  // Returns file_key from the first type 0x01 entry that unwraps.
+  function unwrapSlot(wrappingKey, slot) {
+    return unwrapEntries(slot, { [ENTRY_FRAGMENT]: (entry) => unwrapFileKey(wrappingKey, entry) });
+  }
+
+  // ---- §2.1, §5 Request keys and type 0x02 ---------------------------------
+
+  let x25519Support;
+  function x25519Available() {
+    x25519Support ??= crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits'])
+      .then(() => true, () => false);
+    return x25519Support;
+  }
+
+  // The private key is non-extractable: nothing can read its bytes, only use it.
+  async function generateRequestKey() {
+    const pair = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
+    const publicKey = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
+    return { privateKey: pair.privateKey, publicKey };
+  }
+
+  function encodeRequestKey(publicKey) {
+    requireBytes(publicKey, X25519_KEY_LEN, 'request key');
+    return base64url(publicKey);
+  }
+
+  // X25519(privateKey, publicKey) as 32 bytes. A low-order public key gives
+  // all zeros, and is refused. Firefox already refuses some at import,
+  // Chromium at deriveBits; all three are the same refusal.
+  async function x25519(privateKey, publicKey) {
+    const unusable = () => failure('low-order', 'The key is a low-order point, or does not import as an X25519 public key');
+    let shared;
+    try {
+      const peer = await crypto.subtle.importKey('raw', publicKey, { name: 'X25519' }, true, []);
+      shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: peer }, privateKey, 256));
+    } catch (_) {
+      throw unusable();
+    }
+    if (shared.every((b) => b === 0)) throw unusable();
+    return shared;
+  }
+
+  // §2.1: exactly 43 base64url characters, trailing 2 bits zero, a canonical
+  // X25519 public key that is not of low order.
+  async function decodeRequestKey(text) {
+    const bad = (why) => failure('request-link', `This request link is damaged: ${why}. Ask the person who made it to send it again.`);
+    if (typeof text !== 'string' || !new RegExp(`^[A-Za-z0-9_-]{${REQUEST_KEY_CHARS}}$`).test(text)) {
+      throw bad(`the part after # must be ${REQUEST_KEY_CHARS} base64url characters`);
+    }
+    const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/') + '=');
+    const key = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    if (key.length !== X25519_KEY_LEN || base64url(key) !== text) throw bad('its trailing bits are not zero');
+    // Little-endian u < 2^255 - 19, so one key has one spelling.
+    const nonCanonical = key[31] & 0x80 || (key[31] === 0x7f && key[0] >= 0xed && key.subarray(1, 31).every((b) => b === 0xff));
+    if (nonCanonical) throw bad('it is not a canonical X25519 public key');
+    if (!(await x25519Available())) {
+      throw failure('no-x25519', 'This browser cannot send to a request link: its WebCrypto has no X25519. Try a recent version of another browser.');
+    }
+    try {
+      await x25519((await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits'])).privateKey, key);
+    } catch (_) {
+      throw bad('its key is a low-order point, or not an X25519 public key');
+    }
+    return key;
+  }
+
+  // First 60 bits of SHA-256("sunbird/v1/fingerprint" ‖ key), as 12 Crockford
+  // base32 characters in groups of four.
+  async function requestFingerprint(publicKey) {
+    requireBytes(publicKey, X25519_KEY_LEN, 'request key');
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256',
+      concat(new TextEncoder().encode(INFO_FINGERPRINT), publicKey)));
+    let bits = 0n;
+    for (const b of hash.subarray(0, 8)) bits = (bits << 8n) | BigInt(b);
+    bits >>= 4n;
+    let out = '';
+    for (let i = 11; i >= 0; i--) out += CROCKFORD[Number((bits >> BigInt(5 * i)) & 31n)];
+    return `${out.slice(0, 4)} ${out.slice(4, 8)} ${out.slice(8)}`;
+  }
+
+  const RECIPIENT_AAD = new Uint8Array([VERSION, ENTRY_RECIPIENT]);
+
+  // wrapping_key = HKDF(shared, "sunbird/v1/wrap-x25519" ‖ ephemeral_pk ‖ recipient_pk, 32)
+  async function recipientWrappingKey(shared, salt, ephemeralPk, recipientPk) {
+    const info = concat(new TextEncoder().encode(INFO_WRAP_X25519), ephemeralPk, recipientPk);
+    const raw = await hkdf(shared, salt, info, 32);
+    return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  }
+
+  // Returns the complete 95-byte entry, under a fresh ephemeral key.
+  async function wrapForRecipient(recipientPk, fileKey, salt) {
+    requireBytes(recipientPk, X25519_KEY_LEN, 'recipient key');
+    requireBytes(fileKey, FILE_KEY_LEN, 'file_key');
+    const ephemeral = await generateRequestKey();
+    const shared = await x25519(ephemeral.privateKey, recipientPk);
+    const wrappingKey = await recipientWrappingKey(shared, salt, ephemeral.publicKey, recipientPk);
+    const iv = randomBytes(IV_LEN);
+    const sealed = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: RECIPIENT_AAD, tagLength: TAG_LEN * 8 },
+      wrappingKey,
+      fileKey,
+    ));
+    return concat(new Uint8Array([ENTRY_RECIPIENT, 0, ENTRY_RECIPIENT_BODY_LEN]), ephemeral.publicKey, iv, sealed);
+  }
+
+  // Unwrap one type-0x02 entry with one request key { privateKey, publicKey }.
+  async function unwrapRecipientEntry(requestKey, entry, salt) {
+    if (entry.length !== ENTRY_RECIPIENT_LEN ||
+        ((entry[1] << 8) | entry[2]) !== ENTRY_RECIPIENT_BODY_LEN) {
+      throw new Error('Not a well-formed type 0x02 slot entry');
+    }
+    const ephemeralPk = entry.subarray(3, 3 + X25519_KEY_LEN);
+    const shared = await x25519(requestKey.privateKey, ephemeralPk);
+    const wrappingKey = await recipientWrappingKey(shared, salt, ephemeralPk, requestKey.publicKey);
+    const ivAt = 3 + X25519_KEY_LEN;
+    return new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: entry.subarray(ivAt, ivAt + IV_LEN), additionalData: RECIPIENT_AAD, tagLength: TAG_LEN * 8 },
+      wrappingKey,
+      entry.subarray(ivAt + IV_LEN),
+    ));
+  }
+
+  // Tries every request key against every 0x02 entry. Returns { fileKey, requestKey }.
+  function unlockRequest(header, requestKeys) {
+    return unwrapEntries(header.slot, {
+      [ENTRY_RECIPIENT]: async (entry) => {
+        for (const requestKey of requestKeys) {
+          try {
+            return { fileKey: await unwrapRecipientEntry(requestKey, entry, header.salt), requestKey };
+          } catch (_) { /* next key */ }
+        }
+        throw new Error('no request key unwraps this entry');
+      },
+    });
   }
 
   // ---- §3.1 Header ----------------------------------------------------------
@@ -537,13 +698,18 @@
   }
 
   // Upload, §10 steps 1–7. No passphrase means a public link. maxDownloads 0
-  // means no limit. Returns { fragment, blob }. onProgress hears
-  // { stage: 'passphrase' } before Argon2id, then record counts.
-  async function encryptFile(plaintext, { name, type, passphrase, expiresAt, maxDownloads, onProgress }) {
+  // means no limit. With `recipient` (a request key, §2.1) the slot holds one
+  // 0x02 entry instead, and fragment is null. Returns { fragment, blob }.
+  // onProgress hears { stage: 'passphrase' } before Argon2id, then record counts.
+  async function encryptFile(plaintext, { name, type, passphrase, recipient, expiresAt, maxDownloads, onProgress }) {
     if (!(plaintext instanceof Uint8Array)) throw new Error('plaintext must be a Uint8Array');
     // Refuse bad input before spending seconds on Argon2id.
     if (plaintext.length > MAX_PLAINTEXT) throw failure('too-large', 'File is larger than 100 MiB');
     const restricted = passphrase !== undefined;
+    if (recipient !== undefined) {
+      requireBytes(recipient, X25519_KEY_LEN, 'recipient key');
+      if (restricted) throw new Error('A request link takes no passphrase');
+    }
     if (restricted && (typeof passphrase !== 'string' || passphrase === '')) {
       throw failure('empty-passphrase', 'Passphrase must not be empty');
     }
@@ -563,19 +729,25 @@
     const flags = restricted ? FLAG_PASSPHRASE : 0;
     const prefix = buildHeaderPrefix(flags, salt, expires, maxDownloads);
     // 3
-    if (restricted && onProgress) onProgress({ stage: 'passphrase' });
-    const ikm = await deriveIkm(flags, secret, salt, passphrase);
-    const wrappingKey = await deriveWrappingKey(ikm, salt);
+    let wrappingKey;
+    if (recipient === undefined) {
+      if (restricted && onProgress) onProgress({ stage: 'passphrase' });
+      const ikm = await deriveIkm(flags, secret, salt, passphrase);
+      wrappingKey = await deriveWrappingKey(ikm, salt);
+    }
     // 4
     const metadataCt = await encryptMetadata(fileKey, prefix, fields);
     // 5
-    const slot = concat(new Uint8Array([1]), await wrapFileKey(wrappingKey, fileKey));
+    const entry = recipient === undefined
+      ? await wrapFileKey(wrappingKey, fileKey)
+      : await wrapForRecipient(recipient, fileKey, salt);
+    const slot = concat(new Uint8Array([1]), entry);
     // 6
     const headerCore = concat(prefix, metadataCt);
     // 7
     const body = await encryptRecords(fileKey, headerCore, plaintext, onProgress);
     return {
-      fragment: encodeFragment(secret),
+      fragment: recipient === undefined ? encodeFragment(secret) : null,
       blob: new Blob([headerCore, slot, body], { type: 'application/octet-stream' }),
     };
   }
@@ -623,6 +795,13 @@
     deriveWrappingKey,
     wrapFileKey,
     unwrapSlot,
+    x25519Available,
+    generateRequestKey,
+    encodeRequestKey,
+    decodeRequestKey,
+    requestFingerprint,
+    wrapForRecipient,
+    unlockRequest,
     parseHeader,
     encryptMetadata,
     decryptMetadata,

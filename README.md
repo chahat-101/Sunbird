@@ -9,7 +9,9 @@ on their own: after 24 hours by default (7 days at most), or once they've been
 downloaded as many times as you allowed.
 
 Only members with an upload token can upload; anyone with the link can
-download. For a second lock, add a passphrase and send it some other way.
+download. For a second lock, add a passphrase and send it some other way. If
+you'd rather no link carried a key at all, ask for the file with a request link
+(see below).
 
 ## The page
 
@@ -25,6 +27,32 @@ green and red always come with their own icon or words.
 The recipient sees what kind of link it is, the file's details and a Download
 button. The page never opens or previews the file, and shows file names as
 plain text, never as HTML.
+
+## Request links
+
+To have someone send you a file, open `/r` and make a request link. Your
+browser makes a key pair and keeps the private half. The link holds only the
+public half, so it is safe to post anywhere. You also get a fingerprint, 12
+characters in three groups.
+
+The sender opens the link, checks with you that the fingerprint on their
+screen matches yours, and uploads. They get back a plain `/d/<id>` link with
+nothing after it, and send it to you. Open it in the same browser and the file
+decrypts.
+
+Their limits:
+
+- A request works only in the browser that made it. Opened anywhere else, the
+  link says so, and no download is used up.
+- In a private window the key is lost when the window closes, and so is
+  anything sent to the request.
+- The key stays on your device until a file sent to it has been opened, or for
+  7 days. Until then, anyone who can use that browser profile can use it.
+- The sender must be signed in: they need an upload token like anyone else.
+- One request takes one file. At most 20 requests can wait in one browser.
+- The fingerprint check is what catches a link someone changed on its way to
+  the sender. If the sender skips it, nothing else does.
+- The browser needs X25519 in WebCrypto. One without it says so.
 
 ## Running it
 
@@ -62,7 +90,9 @@ code to leak your key. Only a native client would close that gap.
 
 The server still sees each file's size, and when it's uploaded and downloaded.
 With Google sign-in on, Google knows you used this instance. And anyone with
-the link (plus the passphrase, if there is one) can open the file.
+the link (plus the passphrase, if there is one) can open the file. A file sent
+to a request link is the exception: it opens only with the request's key, in
+the browser that made the request.
 
 Deletion is checked, not forensic. Sunbird unlinks the blob, then checks the
 path to confirm it's gone. If it's still there, the row stays marked, the

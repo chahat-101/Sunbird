@@ -43,6 +43,7 @@ password at all (send-tarnover, `server/routes/password.js:11`,
 directory, and key-loss recovery. Nobody in the study solves the directory
 honestly — ente's is the unverified server
 (`server/pkg/controller/user/user.go:220-230`).
+Request links (D11) use X25519 without any of the three.
 
 **Why this is strong against D1 specifically:** a root admin holds blobs and
 database rows but not the fragment and not the passphrase. They cannot decrypt,
@@ -226,13 +227,68 @@ file contents or file keys.
 ## D10. Sharing graph
 
 Not applicable to v1 — no accounts means no graph. Becomes a real question only
-if per-recipient wrapping arrives (§Q4).
+if per-recipient wrapping arrives (§Q4). Request links (D11) do not make one:
+a request key belongs to one request, not to a person.
+
+---
+
+## D11. Request links: X25519 to a key the recipient hands over
+
+**Chosen:** a second way to share, beside the fragment link, which stays as it
+is. The recipient's browser makes an X25519 key pair and gives out a request
+link that carries only the public key. The sender's browser wraps `file_key`
+to it in one type `0x02` entry (`protocol.md` §5) and the sender gets back a
+link with no fragment. No link carries a secret, so either one can be posted
+where others will see it.
+
+**Why this does not need what D2 ruled out.** D2 rejected per-person X25519
+because it needs accounts, a key directory and key-loss recovery. A request
+link needs none of them. There is no directory because the recipient hands
+their key to the sender directly, inside the link, and the sender checks it by
+fingerprint with the recipient over another channel. Nobody looks a key up,
+so no server has to be trusted to say whose key it is. There are no accounts
+because a key exists for one request and nothing else. And losing a key loses
+one request, which the recipient makes again; there is nothing to recover.
+
+**The fingerprint.** 60 bits of a hash of the public key, read as 12
+characters. Whoever can change the link on its way to the sender can swap in
+their own key, and the fingerprint check is the only thing that catches it.
+Matching a fingerprint they did not choose takes about 2^60 tries. A sender
+who skips the check gets no protection from it. D1's excluded case is
+unchanged: a server serving modified JavaScript can show any fingerprint it
+likes.
+
+**The one stored key.** Sunbird otherwise never keeps keys. Request links
+cannot work without one exception, because the private key has to last from
+making the request until the file is opened. Only that key is stored, as a
+non-extractable CryptoKey in IndexedDB (database `sunbird`, store `requests`,
+with its public key, fingerprint and times). It is deleted as soon as a file
+sent to it decrypts and verifies, or 7 days after it was made; expired ones are
+purged on every page load, and at most 20 wait at once. File keys, fragments
+and passphrases are still never stored anywhere.
+
+**The cost, accepted.** Anyone with access to that browser profile can use the
+key until it is used or expires. Non-extractable means a script cannot copy the
+key's bytes out; it does not stop the key being used inside the profile, by
+someone at the keyboard or by anything else running there. A request also only
+works in the browser that made it, and a private window loses the key when it
+closes.
+
+**Not built.** Request-scoped upload permission: the sender still needs an
+upload token, as for any upload (D9). One request takes one file. The entry
+names no recipient, so the blob does not say whom it is for, and the recipient
+tries each key it holds.
+
+**Format.** D3's slot is what made this additive. Type `0x02` was already
+reserved at 95 bytes; defining it changed no existing byte, and the version
+stays 1 (`protocol.md` §9).
 
 ---
 
 ## Deliberately deferred
 
-- Per-recipient keys and accounts (D2, D3)
+- Per-recipient keys from a key directory, and accounts (D2, D3). Request
+  links (D11) cover the case where the recipient hands over their own key.
 - Native CLI (D8)
 - Distributed operation, R6 (D9)
 - Key loss and multi-device recovery — no prior art found in the study (§5.4)

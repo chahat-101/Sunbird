@@ -243,6 +243,20 @@ body:has(#expired:not([hidden])) .strip-wrap { display: none; }
 #file-name { font-size: 1.25rem; font-weight: 700; line-height: 1.35; letter-spacing: -0.015em; }
 #download-button { justify-self: start; min-height: 56px; padding: 0 28px; font-size: 1rem; }
 
+/* ---- request links */
+.offer { max-width: 62ch; margin-top: 20px; font-size: 0.9375rem; line-height: 1.6; color: var(--ink-2); text-wrap: pretty; }
+.offer a { color: var(--ink); font-weight: 600; }
+.fingerprint { font: 500 1.75rem/1.2 var(--mono); letter-spacing: 0.04em; word-spacing: 0.25em; font-variant-numeric: slashed-zero; overflow-wrap: anywhere; }
+#request-button { justify-self: start; min-height: 56px; padding: 0 28px; font-size: 1rem; }
+.request-made { display: grid; gap: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
+.request-made .btn { justify-self: start; }
+.requests { display: grid; padding: 0; list-style: none; border: 1px solid var(--line); }
+.requests:empty { display: none; }
+.requests li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 16px; padding: 14px 18px; background: var(--paper); }
+.requests li + li { border-top: 1px solid var(--line); }
+.requests code { font: 500 1.0625rem/1.4 var(--mono); letter-spacing: 0.04em; word-spacing: 0.2em; }
+.requests .hint { font-size: 0.8125rem; }
+
 /* ---- sign-in page, rendered by the server */
 .masthead { max-width: 760px; margin: 0 auto; padding: 0 24px; height: 68px; display: flex; align-items: center; }
 .masthead .wordmark { font-size: 1.25rem; line-height: 1; letter-spacing: -0.04em; margin: 0; }
@@ -276,5 +290,8 @@ main:not([id]) > .section { display: grid; gap: 20px; font-size: 1.125rem; }
   .row, .copy-row { grid-template-columns: minmax(0, 1fr); }
   .facts { grid-template-columns: minmax(0, 1fr); row-gap: 0; }
   .facts dd { margin-bottom: 12px; }
-  #download-button, .commit { width: 100%; }
+  #download-button, .commit, #request-button { width: 100%; }
+  .fingerprint { font-size: 1.5rem; }
+  .requests li { grid-template-columns: minmax(0, 1fr); }
+  .requests li .btn { justify-self: start; }
 }
